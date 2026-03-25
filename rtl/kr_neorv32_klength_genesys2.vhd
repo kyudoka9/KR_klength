@@ -137,12 +137,13 @@ architecture rtl of kr_neorv32_klength_genesys2 is
   -- --------------------------------------------------------------------------
   -- Component declaration for the Verilog k-length top module
   -- --------------------------------------------------------------------------
-  component kr_klength_top is
+  component kr_klength_banked_top is
     generic (
-      N_CHANNELS  : integer := 8;
-      TAG_BITS    : integer := 10;
+      N_BANKS     : integer := 8;
+      CH_PER_BANK : integer := 48;
+      TAG_BITS    : integer := 12;
       DATA_BITS   : integer := 32;
-      BRAM_ADDR_W : integer := 13
+      BRAM_ADDR_W : integer := 15
     );
     port (
       clk             : in  std_logic;
@@ -378,10 +379,11 @@ begin
   -- ==========================================================================
   -- KR k-Length Computing Fabric
   -- ==========================================================================
-  kr_klength_inst : kr_klength_top
+  kr_klength_inst : kr_klength_banked_top
   generic map (
-    N_CHANNELS  => 48,          -- 48 MAC channels (exploit Kintex-7 resources)
-    TAG_BITS    => 12,          -- 4096 in-flight micro-ops (Kintex-7 headroom)
+    N_BANKS     => 8,           -- 8 banks × 48 channels = 384 MAC channels
+    CH_PER_BANK => 48,
+    TAG_BITS    => 12,          -- 4096 recycling tags (unlimited operand length)
     DATA_BITS   => 32,
     BRAM_ADDR_W => 15           -- 2^15 = 32768 words = 128 KB operand storage
   )
