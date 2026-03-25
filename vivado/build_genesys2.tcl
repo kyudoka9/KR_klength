@@ -1,11 +1,9 @@
 # ================================================================================ #
-# KR RISC-V Scientific Coprocessor — Vivado Build Script                           #
-# Numato Mimas A7 V2.0 — XC7A50T-1FGG484                                          #
+# KR k-Length Computing Platform — Vivado Build Script                             #
+# Digilent Genesys 2 — XC7K325T-2FFG900C                                          #
 #                                                                                  #
-# K-Length Top (kr_neorv32_klength_top)                                            #
-#                                                                                  #
-# Usage: vivado -mode batch -source build_mimas_a7.tcl                             #
-#   or:  vivado -mode tcl -source build_mimas_a7.tcl                               #
+# Usage: vivado -mode batch -source build_genesys2.tcl                             #
+#   or:  vivado -mode tcl -source build_genesys2.tcl                               #
 #                                                                                  #
 # Copyright 2026 Kyudoka Research, H. Ismail <ismh@kyudoka.org>                    #
 # ================================================================================ #
@@ -16,7 +14,7 @@ set proj_dir   [file normalize "$script_dir/.."]
 set neorv32_rtl "$proj_dir/neorv32/rtl/core"
 set kr_rtl      "$proj_dir/rtl"
 set constraints "$proj_dir/constraints"
-set output_dir  "$proj_dir/vivado/output"
+set output_dir  "$proj_dir/vivado/output/kr_klength_genesys2"
 
 # Create output directory
 file mkdir $output_dir
@@ -24,7 +22,7 @@ file mkdir $output_dir
 # ============================================================================
 # Create project
 # ============================================================================
-create_project kr_riscv_mimas_a7 "$output_dir/kr_riscv_mimas_a7" -part xc7a50tfgg484-1 -force
+create_project kr_klength_genesys2 "$output_dir" -part xc7k325tffg900-2 -force
 
 set_property target_language VHDL [current_project]
 
@@ -38,49 +36,33 @@ set_property library neorv32 [get_files -filter {FILE_TYPE == VHDL && NAME =~ "*
 # ============================================================================
 # Replace the default CFU with our bignum CFU
 # ============================================================================
-# Remove the default XTEA CFU from the project
 remove_files [get_files -quiet "*/neorv32_cpu_alu_cfu.vhd"]
 
-# Add our bignum CFU (same entity name, drop-in replacement)
 add_files -norecurse "$kr_rtl/kr_bignum_cfu.vhd"
 set_property library neorv32 [get_files "*/kr_bignum_cfu.vhd"]
 
 # ============================================================================
-# Add K-Length accelerator RTL (Verilog)
+# Add KR k-Length Computing Verilog sources
 # ============================================================================
-add_files -norecurse [list \
-    "$kr_rtl/kr_decomp_engine.v" \
-    "$kr_rtl/kr_klength_top.v" \
-    "$kr_rtl/kr_klength_bram.v" \
-    "$kr_rtl/kr_klength_regs.v" \
-    "$kr_rtl/kr_klength_fu_mac.v" \
-    "$kr_rtl/kr_klength_cdb.v" \
-    "$kr_rtl/kr_klength_channel.v" \
-    "$kr_rtl/kr_klength_decode.v" \
-    "$kr_rtl/kr_klength_distributor.v" \
-    "$kr_rtl/kr_klength_fu_delay.v" \
-    "$kr_rtl/kr_klength_issue_queue.v" \
-    "$kr_rtl/kr_klength_result_collector.v" \
-    "$kr_rtl/kr_klength_rs_table.v" \
-    "$kr_rtl/kr_klength_scheduler_array.v" \
-    "$kr_rtl/kr_klength_scoreboard.v" \
-]
+set klength_v_files [glob -directory $kr_rtl kr_klength_*.v]
+add_files -norecurse $klength_v_files
+
+add_files -norecurse "$kr_rtl/kr_decomp_engine.v"
 
 # ============================================================================
-# Add board-level top module
+# Add Genesys 2 board-level top module
 # ============================================================================
-add_files -norecurse "$kr_rtl/kr_neorv32_klength_top.vhd"
-# Top module uses default library (work), references neorv32 library
+add_files -norecurse "$kr_rtl/kr_neorv32_klength_genesys2.vhd"
 
 # ============================================================================
 # Add constraints
 # ============================================================================
-add_files -fileset constrs_1 -norecurse "$constraints/mimas_a7.xdc"
+add_files -fileset constrs_1 -norecurse "$constraints/genesys2_klength.xdc"
 
 # ============================================================================
 # Set top module
 # ============================================================================
-set_property top kr_neorv32_klength_top [current_fileset]
+set_property top kr_neorv32_klength_genesys2 [current_fileset]
 
 # ============================================================================
 # Synthesis settings
@@ -97,12 +79,11 @@ set_property strategy Performance_ExploreWithRemap [get_runs impl_1]
 # Run synthesis
 # ============================================================================
 puts "================================================================"
-puts " KR RISC-V: Starting synthesis..."
+puts " KR k-Length: Starting synthesis (Genesys 2)..."
 puts "================================================================"
 launch_runs synth_1 -jobs [exec nproc]
 wait_on_run synth_1
 
-# Check synthesis status
 if {[get_property PROGRESS [get_runs synth_1]] != "100%"} {
     puts "ERROR: Synthesis failed!"
     exit 1
@@ -113,7 +94,7 @@ puts "Synthesis complete."
 # Run implementation (place & route)
 # ============================================================================
 puts "================================================================"
-puts " KR RISC-V: Starting implementation..."
+puts " KR k-Length: Starting implementation (Genesys 2)..."
 puts "================================================================"
 launch_runs impl_1 -jobs [exec nproc]
 wait_on_run impl_1
@@ -128,18 +109,13 @@ puts "Implementation complete."
 # Generate bitstream
 # ============================================================================
 puts "================================================================"
-puts " KR RISC-V: Generating bitstream..."
+puts " KR k-Length: Generating bitstream (Genesys 2)..."
 puts "================================================================"
 launch_runs impl_1 -to_step write_bitstream -jobs [exec nproc]
 wait_on_run impl_1
 
-puts "================================================================"
-puts " KR RISC-V: Build complete!"
-puts " Bitstream: $output_dir/kr_riscv_mimas_a7/kr_riscv_mimas_a7.runs/impl_1/kr_neorv32_klength_top.bit"
-puts "================================================================"
-
 # ============================================================================
-# Report utilization
+# Reports
 # ============================================================================
 open_run impl_1
 report_utilization -file "$output_dir/utilization_report.txt"
@@ -147,6 +123,11 @@ report_timing_summary -file "$output_dir/timing_report.txt"
 
 puts "\nUtilization summary:"
 report_utilization -hierarchical -hierarchical_depth 2
+
+puts "================================================================"
+puts " KR k-Length: Build complete! (Genesys 2)"
+puts " Bitstream: $output_dir/kr_klength_genesys2.runs/impl_1/kr_neorv32_klength_genesys2.bit"
+puts "================================================================"
 
 # Close project
 close_project
