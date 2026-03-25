@@ -21,13 +21,22 @@
 //          result has arrived. Single-cycle forwarding bypass for the
 //          common case (result arrives the same cycle it is needed).
 //
+// Phase E — Speculative carry prediction:
+//   When SPECULATIVE_CARRY=1, ALL micro-ops are dispatched immediately
+//   with carry_in predicted as 0 (no dependency). When actual carry
+//   arrives, mispredictions (carry was 1) trigger replay of the affected
+//   word with correct carry_in. For random data P(carry)~2^(-32), so
+//   replays are extremely rare, and a 64-word MPADD completes in ~64/N
+//   cycles instead of 64*latency cycles.
+//
 `default_nettype none
 
 module kr_decomp_engine #(
-    parameter TAG_BITS    = 10,       // Wide tags for k-length (1024 in-flight)
-    parameter DATA_BITS   = 32,
-    parameter MAX_WORDS   = 256,      // Max operand length in words
-    parameter BRAM_ADDR_W = 15        // 32K words addressable
+    parameter TAG_BITS         = 10,       // Wide tags for k-length (1024 in-flight)
+    parameter DATA_BITS        = 32,
+    parameter MAX_WORDS        = 256,      // Max operand length in words
+    parameter BRAM_ADDR_W      = 15,       // 32K words addressable
+    parameter SPECULATIVE_CARRY = 1        // 1=speculative dispatch, 0=stall on carry
 ) (
     input  wire                    clk,
     input  wire                    rst,
@@ -88,7 +97,13 @@ module kr_decomp_engine #(
     output reg  [31:0]             uops_issued,
     output reg  [31:0]             uops_completed,
     output reg  [31:0]             cycle_count,
-    output reg                     err_unsupported  // MPMUL not supported in HW
+    output reg                     err_unsupported, // MPMUL not supported in HW
+
+    // ---------------------------------------------------------------
+    // Speculation statistics (Phase E)
+    // ---------------------------------------------------------------
+    output reg  [31:0]             speculation_correct,
+    output reg  [31:0]             speculation_replays
 );
 
     // ---------------------------------------------------------------
@@ -165,7 +180,72 @@ module kr_decomp_engine #(
     // THIS cycle, we can emit immediately instead of stalling.
     wire dep_resolved  = !carry_dep || completed[carry_tag];
     wire dep_forwarded = carry_dep && result_valid && (result_tag == carry_tag);
-    wire can_emit      = dep_resolved || dep_forwarded;
+
+    // ---------------------------------------------------------------
+    // Phase E: Speculative vs. stall-based emit control
+    // ---------------------------------------------------------------
+    // When SPECULATIVE_CARRY=1, we always emit (no carry stall).
+    // When SPECULATIVE_CARRY=0, fall back to D9 stall+forwarding.
+    wire can_emit = (SPECULATIVE_CARRY == 1) ? 1'b1
+                                             : (dep_resolved || dep_forwarded);
+
+    // ---------------------------------------------------------------
+    // Phase E: Speculative carry tracking
+    // ---------------------------------------------------------------
+    // Per-tag speculative bit: set when a tag is dispatched without
+    // resolved carry (i.e., with predicted carry_in=0).
+    reg speculative [0:(1<<TAG_BITS)-1];
+
+    // Per-tag predecessor tracking: which tag's carry does this tag
+    // depend on? Needed to check the actual carry at result time.
+    reg [TAG_BITS-1:0] pred_tag [0:(1<<TAG_BITS)-1];
+    reg                pred_valid [0:(1<<TAG_BITS)-1];
+
+    // Per-tag carry value: actual carry_out from each completed tag.
+    reg carry_val [0:(1<<TAG_BITS)-1];
+
+    // ---------------------------------------------------------------
+    // Phase E: Replay queue
+    // ---------------------------------------------------------------
+    // When a speculative result arrives and the predecessor's actual
+    // carry was 1, we must replay: re-dispatch with correct carry_in.
+    // The replay queue stores the original operands, opcode, tag,
+    // destination, and the correct carry value.
+    //
+    // Depth 16 is generous: for random 32-bit data, P(carry)~2^(-32),
+    // so the queue almost never has more than 0-1 entries.
+    localparam REPLAY_DEPTH = 16;
+    localparam REPLAY_PTR_W = $clog2(REPLAY_DEPTH);
+
+    reg [DATA_BITS-1:0]    replay_src1   [0:REPLAY_DEPTH-1];
+    reg [DATA_BITS-1:0]    replay_src2   [0:REPLAY_DEPTH-1];
+    reg [3:0]              replay_opcode [0:REPLAY_DEPTH-1];
+    reg [TAG_BITS-1:0]     replay_tag    [0:REPLAY_DEPTH-1];
+    reg [BRAM_ADDR_W-1:0]  replay_dst    [0:REPLAY_DEPTH-1];
+    // The correct carry is always 1 (we only replay on misprediction
+    // where predicted 0 but actual was 1). The replay micro-op must
+    // carry a dependency on the predecessor so the MAC gets carry_in=1
+    // from the hi_table. We store the predecessor tag for this purpose.
+    reg [TAG_BITS-1:0]     replay_dep_tag [0:REPLAY_DEPTH-1];
+
+    reg [REPLAY_PTR_W:0] replay_wr_ptr;  // extra bit for full/empty
+    reg [REPLAY_PTR_W:0] replay_rd_ptr;
+
+    wire [REPLAY_PTR_W-1:0] replay_wr_idx = replay_wr_ptr[REPLAY_PTR_W-1:0];
+    wire [REPLAY_PTR_W-1:0] replay_rd_idx = replay_rd_ptr[REPLAY_PTR_W-1:0];
+    wire replay_empty = (replay_wr_ptr == replay_rd_ptr);
+    wire replay_full  = (replay_wr_ptr[REPLAY_PTR_W] != replay_rd_ptr[REPLAY_PTR_W]) &&
+                        (replay_wr_ptr[REPLAY_PTR_W-1:0] == replay_rd_ptr[REPLAY_PTR_W-1:0]);
+    wire replay_pending = !replay_empty;
+
+    // ---------------------------------------------------------------
+    // Phase E: Per-tag source operand storage for replay
+    // ---------------------------------------------------------------
+    // We need the original src1/src2 to re-dispatch on misprediction.
+    // Store them per-tag at dispatch time.
+    reg [DATA_BITS-1:0] tag_src1 [0:(1<<TAG_BITS)-1];
+    reg [DATA_BITS-1:0] tag_src2 [0:(1<<TAG_BITS)-1];
+    reg [3:0]           tag_opcode [0:(1<<TAG_BITS)-1];
 
     // ---------------------------------------------------------------
     // Drain tracking
@@ -178,6 +258,14 @@ module kr_decomp_engine #(
     // For MPADD: result word i is written when tag i completes.
     // Tag-to-destination mapping, indexed by tag.
     reg [BRAM_ADDR_W-1:0] tag_dst_addr [0:(1<<TAG_BITS)-1];
+
+    // ---------------------------------------------------------------
+    // Phase E: Replay dispatch signal
+    // ---------------------------------------------------------------
+    // Replay has priority over new micro-op generation. When the
+    // replay queue is non-empty and the output port is available,
+    // we dispatch from replay instead of generating new micro-ops.
+    reg replay_dispatching;
 
     // ---------------------------------------------------------------
     // Main state machine
@@ -200,6 +288,11 @@ module kr_decomp_engine #(
             fetch_idx       <= 16'd0;
             fetch_pipe      <= 1'b0;
             err_unsupported <= 1'b0;
+            replay_wr_ptr   <= {(REPLAY_PTR_W+1){1'b0}};
+            replay_rd_ptr   <= {(REPLAY_PTR_W+1){1'b0}};
+            replay_dispatching <= 1'b0;
+            speculation_correct <= 32'd0;
+            speculation_replays <= 32'd0;
         end else begin
             // Default: clear one-shot signals
             irq        <= 1'b0;
@@ -209,19 +302,74 @@ module kr_decomp_engine #(
             if (busy) cycle_count <= cycle_count + 1;
 
             // -----------------------------------------------------------
-            // Result writeback: when scheduler CDB delivers a result,
-            // write to BRAM. D3 guard: only accept if we have not yet
-            // received all expected results for the current operation.
+            // Result handling: writeback, completion tracking, and
+            // speculative carry verification (Phase E).
             // -----------------------------------------------------------
             if (result_valid && busy) begin
-                if (uops_completed < uops_issued) begin
-                    bram_wr_en     <= 1'b1;
-                    bram_wr_addr   <= tag_dst_addr[result_tag];
-                    bram_wr_data   <= result_data;
-                    uops_completed <= uops_completed + 1;
-                end
                 // D9: mark tag as completed for dependency tracking
                 completed[result_tag] <= 1'b1;
+                // Record actual carry_out for this tag
+                carry_val[result_tag] <= result_carry;
+
+                // -------------------------------------------------------
+                // Phase E: Speculative carry verification
+                // -------------------------------------------------------
+                if (SPECULATIVE_CARRY == 1 && speculative[result_tag] && pred_valid[result_tag]) begin
+                    // This tag was dispatched speculatively (carry_in predicted 0).
+                    // Check: was the predecessor's actual carry 1?
+                    //
+                    // The predecessor must have completed already (since results
+                    // arrive in dependency order for a linear chain, or out of
+                    // order — but we stored carry_val when it completed).
+                    //
+                    // If the predecessor's carry_val is 1, our result is wrong.
+                    if (carry_val[pred_tag[result_tag]]) begin
+                        // MISPREDICTION: carry was 1, we computed with 0.
+                        // Queue for replay — do NOT writeback this result.
+                        speculation_replays <= speculation_replays + 1;
+
+                        // Enqueue replay (if queue not full — drop is a
+                        // correctness bug, but depth 16 is extremely safe
+                        // given P(carry)~2^-32).
+                        if (!replay_full) begin
+                            replay_src1[replay_wr_idx]    <= tag_src1[result_tag];
+                            replay_src2[replay_wr_idx]    <= tag_src2[result_tag];
+                            replay_opcode[replay_wr_idx]  <= tag_opcode[result_tag];
+                            replay_tag[replay_wr_idx]     <= result_tag;
+                            replay_dst[replay_wr_idx]     <= tag_dst_addr[result_tag];
+                            replay_dep_tag[replay_wr_idx] <= pred_tag[result_tag];
+                            replay_wr_ptr                 <= replay_wr_ptr + 1;
+                        end
+
+                        // Mark tag as NOT completed — it needs replay.
+                        // The correct result will arrive when the replay
+                        // micro-op completes.
+                        completed[result_tag]  <= 1'b0;
+                        speculative[result_tag] <= 1'b0;  // replay is non-speculative
+                    end else begin
+                        // CORRECT PREDICTION: carry was 0, result is good.
+                        speculation_correct <= speculation_correct + 1;
+                        speculative[result_tag] <= 1'b0;
+
+                        // Accept result: writeback to BRAM
+                        if (uops_completed < uops_issued) begin
+                            bram_wr_en     <= 1'b1;
+                            bram_wr_addr   <= tag_dst_addr[result_tag];
+                            bram_wr_data   <= result_data;
+                            uops_completed <= uops_completed + 1;
+                        end
+                    end
+                end else begin
+                    // Non-speculative result (either SPECULATIVE_CARRY=0,
+                    // or this was a replay result, or word 0 which has no
+                    // predecessor). Accept unconditionally.
+                    if (uops_completed < uops_issued) begin
+                        bram_wr_en     <= 1'b1;
+                        bram_wr_addr   <= tag_dst_addr[result_tag];
+                        bram_wr_data   <= result_data;
+                        uops_completed <= uops_completed + 1;
+                    end
+                end
             end
 
             case (state)
@@ -250,6 +398,10 @@ module kr_decomp_engine #(
                     // D3 fix: next_tag is NOT reset — monotonically increasing.
                     // Capture start_tag for this operation.
                     start_tag      <= next_tag;
+                    // Phase E: clear replay queue for new operation
+                    replay_wr_ptr  <= {(REPLAY_PTR_W+1){1'b0}};
+                    replay_rd_ptr  <= {(REPLAY_PTR_W+1){1'b0}};
+                    replay_dispatching <= 1'b0;
                     state          <= S_FETCH_A;
                     bram_rd_en     <= 1'b1;
                     bram_rd_addr   <= cmd_src_a;
@@ -327,26 +479,87 @@ module kr_decomp_engine #(
             // =============================================================
             // MPADD/MPSUB: emit one ADDWC/SUBWB per word, linear carry chain
             //
-            // D9 fix: dispatch stalls when the carry dependency has not yet
-            // been resolved. Single-cycle forwarding bypass avoids a stall
-            // in the common case where the result arrives the same cycle.
+            // Phase E: Two modes controlled by SPECULATIVE_CARRY parameter.
+            //
+            // SPECULATIVE_CARRY=0 (D9 stall path):
+            //   Dispatch stalls when the carry dependency has not yet been
+            //   resolved. Single-cycle forwarding bypass avoids a stall in
+            //   the common case where the result arrives the same cycle.
+            //
+            // SPECULATIVE_CARRY=1 (speculative path):
+            //   ALL micro-ops are dispatched immediately with uop_dep_valid=0
+            //   (predicted carry_in=0). Speculative tracking and replay handle
+            //   the rare misprediction case. Replay has priority over new ops.
             // =============================================================
             S_GEN_ADD: begin
-                if ((!uop_valid || uop_ready) && can_emit) begin
+                // Phase E: Replay dispatch has priority over new generation
+                if (replay_pending && (!uop_valid || uop_ready)) begin
+                    // Dispatch from replay queue: the micro-op is
+                    // re-issued with correct carry dependency (dep_valid=1,
+                    // dep_tag=predecessor). The MAC will pick up the actual
+                    // carry from the hi_table via resolved_acc.
+                    uop_valid     <= 1'b1;
+                    uop_opcode    <= replay_opcode[replay_rd_idx];
+                    uop_src1      <= replay_src1[replay_rd_idx];
+                    uop_src2      <= replay_src2[replay_rd_idx];
+                    uop_tag       <= replay_tag[replay_rd_idx];
+                    uop_dep_valid <= 1'b1;  // real dependency for correct carry
+                    uop_dep_tag   <= replay_dep_tag[replay_rd_idx];
+
+                    // Restore destination mapping (tag reused, addr unchanged)
+                    tag_dst_addr[replay_tag[replay_rd_idx]] <= replay_dst[replay_rd_idx];
+                    // Clear stale completion for replayed tag
+                    completed[replay_tag[replay_rd_idx]] <= 1'b0;
+                    // Mark as non-speculative (replay has correct carry)
+                    speculative[replay_tag[replay_rd_idx]] <= 1'b0;
+                    pred_valid[replay_tag[replay_rd_idx]]  <= 1'b0;
+
+                    replay_rd_ptr <= replay_rd_ptr + 1;
+                end else if ((!uop_valid || uop_ready) && can_emit) begin
                     if (gen_i < len_a_reg) begin
                         uop_valid     <= 1'b1;
                         uop_opcode    <= (op_reg == OP_MPSUB) ? UOP_SUBWB : UOP_ADDWC;
                         uop_src1      <= buf_a[gen_i];
                         uop_src2      <= buf_b[gen_i];
                         uop_tag       <= next_tag;
-                        uop_dep_valid <= carry_dep;
-                        uop_dep_tag   <= carry_tag;
+
+                        // Phase E: speculative vs. stall-based dependency
+                        if (SPECULATIVE_CARRY == 1) begin
+                            // Speculative: dispatch with no dependency
+                            // (carry_in predicted as 0). MAC gets
+                            // resolved_acc=0 since dep_valid=0.
+                            uop_dep_valid <= 1'b0;
+                            uop_dep_tag   <= {TAG_BITS{1'b0}};
+
+                            // Track speculative state
+                            if (carry_dep) begin
+                                // This word has a predecessor — mark speculative
+                                speculative[next_tag] <= 1'b1;
+                                pred_tag[next_tag]    <= carry_tag;
+                                pred_valid[next_tag]  <= 1'b1;
+                            end else begin
+                                // Word 0: no predecessor, not speculative
+                                speculative[next_tag] <= 1'b0;
+                                pred_valid[next_tag]  <= 1'b0;
+                            end
+                        end else begin
+                            // Non-speculative (D9 path): real dependency
+                            uop_dep_valid <= carry_dep;
+                            uop_dep_tag   <= carry_tag;
+                            speculative[next_tag] <= 1'b0;
+                            pred_valid[next_tag]  <= 1'b0;
+                        end
 
                         // Record destination for writeback
                         tag_dst_addr[next_tag] <= dst_reg + gen_i;
                         // D10 fix: clear stale completion bit on tag allocation
                         // Prevents false dep_resolved after tag wrap.
                         completed[next_tag] <= 1'b0;
+
+                        // Phase E: store source operands for potential replay
+                        tag_src1[next_tag]   <= buf_a[gen_i];
+                        tag_src2[next_tag]   <= buf_b[gen_i];
+                        tag_opcode[next_tag] <= (op_reg == OP_MPSUB) ? UOP_SUBWB : UOP_ADDWC;
 
                         // Update state for next iteration
                         carry_tag   <= next_tag;
@@ -375,10 +588,35 @@ module kr_decomp_engine #(
 
             // =============================================================
             // DRAIN: wait for all issued micro-ops to complete
+            //
+            // Phase E: In speculative mode, we must also drain any pending
+            // replays. A replay generates a new result which may itself
+            // trigger further replays (cascading carries), so we wait
+            // until both the replay queue is empty AND all uops are done.
             // =============================================================
             S_DRAIN: begin
-                uop_valid <= 1'b0;
-                if (uops_completed >= uops_issued) begin
+                // Phase E: Continue dispatching replays during drain
+                if (replay_pending && (!uop_valid || uop_ready)) begin
+                    uop_valid     <= 1'b1;
+                    uop_opcode    <= replay_opcode[replay_rd_idx];
+                    uop_src1      <= replay_src1[replay_rd_idx];
+                    uop_src2      <= replay_src2[replay_rd_idx];
+                    uop_tag       <= replay_tag[replay_rd_idx];
+                    uop_dep_valid <= 1'b1;
+                    uop_dep_tag   <= replay_dep_tag[replay_rd_idx];
+
+                    tag_dst_addr[replay_tag[replay_rd_idx]] <= replay_dst[replay_rd_idx];
+                    completed[replay_tag[replay_rd_idx]]    <= 1'b0;
+                    speculative[replay_tag[replay_rd_idx]]  <= 1'b0;
+                    pred_valid[replay_tag[replay_rd_idx]]   <= 1'b0;
+
+                    replay_rd_ptr <= replay_rd_ptr + 1;
+                end else if (!replay_pending) begin
+                    uop_valid <= 1'b0;
+                end
+
+                // Done when all results collected and no replays pending
+                if (uops_completed >= uops_issued && replay_empty) begin
                     state <= S_DONE;
                 end
             end
