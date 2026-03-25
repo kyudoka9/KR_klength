@@ -34,6 +34,9 @@
 #define REG_CMD_PROGRESS  KLENGTH_REG(0x20)
 #define REG_CMD_CYCLES    KLENGTH_REG(0x24)
 #define REG_CMD_MAGIC     KLENGTH_REG(0x28)
+#define REG_WATCHDOG_STATUS  KLENGTH_REG(0x2C)
+#define REG_MISSING_COUNT    KLENGTH_REG(0x30)
+#define REG_TIMEOUT_TAG      KLENGTH_REG(0x34)
 
 #define KLENGTH_MAGIC     0x4B4C454E  // "KLEN"
 
@@ -45,6 +48,10 @@
 // Status bits
 #define KLENGTH_STATUS_BUSY  (1 << 0)
 #define KLENGTH_STATUS_DONE  (1 << 1)
+
+// Watchdog status bits
+#define KLENGTH_WD_TIMEOUT   (1 << 0)
+#define KLENGTH_WD_COMPLETE  (1 << 1)
 
 // ============================================================================
 // BRAM operand memory layout (word addresses, not byte)

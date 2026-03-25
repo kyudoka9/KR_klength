@@ -16,6 +16,9 @@
 //   0x20: CMD_PROGRESS  [RO]  uops_completed (low 16) | uops_issued (high 16)
 //   0x24: CMD_CYCLES    [RO]  Cycle count for last/current operation
 //   0x28: CMD_MAGIC     [RO]  Magic number: 0x4B4C454E ("KLEN")
+//   0x2C: WATCHDOG_STATUS [RO]  Bit 0: timeout_alert, Bit 1: all_complete
+//   0x30: MISSING_COUNT   [RO]  Number of incomplete micro-ops
+//   0x34: TIMEOUT_TAG     [RO]  Tag that timed out
 //
 `default_nettype none
 
@@ -54,7 +57,15 @@ module kr_klength_regs #(
     input  wire                    de_done,
     input  wire [31:0]             de_uops_issued,
     input  wire [31:0]             de_uops_completed,
-    input  wire [31:0]             de_cycle_count
+    input  wire [31:0]             de_cycle_count,
+
+    // ---------------------------------------------------------------
+    // Watchdog status (from kr_klength_watchdog)
+    // ---------------------------------------------------------------
+    input  wire                    wd_timeout_alert,
+    input  wire                    wd_all_complete,
+    input  wire [31:0]             wd_missing_count,
+    input  wire [11:0]             wd_timeout_tag
 );
 
     localparam MAGIC = 32'h4B4C454E;  // "KLEN"
@@ -114,6 +125,9 @@ module kr_klength_regs #(
             5'd8: wb_dat_o = {de_uops_issued[15:0], de_uops_completed[15:0]};  // PROGRESS
             5'd9: wb_dat_o = de_cycle_count;
             5'd10: wb_dat_o = MAGIC;
+            5'd11: wb_dat_o = {30'd0, wd_all_complete, wd_timeout_alert};  // WATCHDOG_STATUS
+            5'd12: wb_dat_o = wd_missing_count;                             // MISSING_COUNT
+            5'd13: wb_dat_o = {20'd0, wd_timeout_tag};                      // TIMEOUT_TAG
             default: wb_dat_o = 32'd0;
         endcase
     end
