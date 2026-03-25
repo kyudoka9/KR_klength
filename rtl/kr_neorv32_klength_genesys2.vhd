@@ -381,7 +381,7 @@ begin
   kr_klength_inst : kr_klength_top
   generic map (
     N_CHANNELS  => 48,          -- 48 MAC channels (exploit Kintex-7 resources)
-    TAG_BITS    => 10,
+    TAG_BITS    => 12,          -- 4096 in-flight micro-ops (Kintex-7 headroom)
     DATA_BITS   => 32,
     BRAM_ADDR_W => 15           -- 2^15 = 32768 words = 128 KB operand storage
   )
