@@ -8,3 +8,8 @@ name = "KLengthProofs"
 [[lean_exe]]
 name = "klengthproofs"
 root = "Main"
+
+[[require]]
+name = "mathlib"
+scope = "leanprover-community"
+version = "git#v4.28.0"
