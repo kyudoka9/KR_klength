@@ -344,6 +344,9 @@ module kr_decomp_engine #(
 
                         // Record destination for writeback
                         tag_dst_addr[next_tag] <= dst_reg + gen_i;
+                        // D10 fix: clear stale completion bit on tag allocation
+                        // Prevents false dep_resolved after tag wrap.
+                        completed[next_tag] <= 1'b0;
 
                         // Update state for next iteration
                         carry_tag   <= next_tag;
