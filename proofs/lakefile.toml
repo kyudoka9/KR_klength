@@ -1,0 +1,10 @@
+name = "KLengthProofs"
+version = "0.1.0"
+defaultTargets = ["klengthproofs"]
+
+[[lean_lib]]
+name = "KLengthProofs"
+
+[[lean_exe]]
+name = "klengthproofs"
+root = "Main"
