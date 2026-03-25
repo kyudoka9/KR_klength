@@ -86,7 +86,7 @@ module kr_klength_banked_top #(
     wire                    result_valid;
     wire [TAG_BITS-1:0]     result_tag;
     wire [DATA_BITS-1:0]    result_data;
-    wire                    result_carry;
+    wire                    result_hi;
 
     // ===================================================================
     // Per-bank signals
@@ -95,7 +95,7 @@ module kr_klength_banked_top #(
     wire [N_TOTAL-1:0]                      mac_fu_busy;
     wire [N_TOTAL-1:0]                      mac_fu_valid;
     wire [N_TOTAL-1:0]                      mac_result_valid;
-    wire [N_TOTAL-1:0]                      mac_result_carry;
+    wire [N_TOTAL-1:0]                      mac_result_hi;
     wire [N_TOTAL*DATA_BITS-1:0]            mac_result_data;
     wire [N_TOTAL*TAG_BITS-1:0]             mac_result_tag;
 
@@ -117,7 +117,7 @@ module kr_klength_banked_top #(
     // Updated from registered result output (inter-bank merge)
     always @(posedge clk) begin
         if (result_valid)
-            carry_table[result_tag] <= result_carry;
+            carry_table[result_tag] <= result_hi;
     end
 
     wire resolved_carry_in = (uop_dep_valid && uop_valid)
@@ -214,7 +214,7 @@ module kr_klength_banked_top #(
         .uop_opcode (uop_opcode), .uop_src1 (uop_src1), .uop_src2 (uop_src2),
         .uop_tag (uop_tag), .uop_dep_valid (uop_dep_valid), .uop_dep_tag (uop_dep_tag),
         .result_valid (result_valid), .result_tag (result_tag),
-        .result_data (result_data), .result_carry (result_carry),
+        .result_data (result_data), .result_hi (result_hi),
         .busy (de_busy), .done (de_done), .irq (de_irq),
         .uops_issued (de_uops_issued), .uops_completed (de_uops_completed),
         .cycle_count (de_cycle_count)
@@ -368,7 +368,7 @@ module kr_klength_banked_top #(
                     .result_data    (mac_result_data[IDX*DATA_BITS +: DATA_BITS]),
                     .result_dest_reg(),
                     .result_opcode  (),
-                    .result_carry   (mac_result_carry[IDX]),
+                    .result_hi   (mac_result_hi[IDX]),
                     .fu_busy        (mac_fu_busy[IDX])
                 );
             end
@@ -384,7 +384,7 @@ module kr_klength_banked_top #(
     wire [N_BANKS-1:0]                 bank_drain_valid;
     wire [N_BANKS*TAG_BITS-1:0]        bank_drain_tag;
     wire [N_BANKS*DATA_BITS-1:0]       bank_drain_data;
-    wire [N_BANKS-1:0]                 bank_drain_carry;
+    wire [N_BANKS-1:0]                 bank_drain_hi;
 
     generate
         for (bi = 0; bi < N_BANKS; bi = bi + 1) begin : gen_bank_collect
@@ -393,7 +393,7 @@ module kr_klength_banked_top #(
             reg [CH_PER_BANK-1:0]   latch_valid;
             reg [TAG_BITS-1:0]      latch_tag   [0:CH_PER_BANK-1];
             reg [DATA_BITS-1:0]     latch_data  [0:CH_PER_BANK-1];
-            reg [CH_PER_BANK-1:0]   latch_carry;
+            reg [CH_PER_BANK-1:0]   latch_hi;
 
             reg [CH_BITS-1:0]       drain_rr;
             reg [CH_BITS-1:0]       drain_sel;
@@ -404,14 +404,14 @@ module kr_klength_banked_top #(
                 integer k;
                 if (rst) begin
                     latch_valid <= {CH_PER_BANK{1'b0}};
-                    latch_carry <= {CH_PER_BANK{1'b0}};
+                    latch_hi <= {CH_PER_BANK{1'b0}};
                 end else begin
                     for (k = 0; k < CH_PER_BANK; k = k + 1) begin
                         if (mac_result_valid[bi*CH_PER_BANK + k]) begin
                             latch_valid[k] <= 1'b1;
                             latch_tag[k]   <= mac_result_tag[(bi*CH_PER_BANK+k)*TAG_BITS +: TAG_BITS];
                             latch_data[k]  <= mac_result_data[(bi*CH_PER_BANK+k)*DATA_BITS +: DATA_BITS];
-                            latch_carry[k] <= mac_result_carry[bi*CH_PER_BANK + k];
+                            latch_hi[k] <= mac_result_hi[bi*CH_PER_BANK + k];
                         end
                         // Clear when drained
                         if (drain_found && drain_sel == k)
@@ -445,7 +445,7 @@ module kr_klength_banked_top #(
             reg                    bank_drain_valid_r;
             reg [TAG_BITS-1:0]     bank_drain_tag_r;
             reg [DATA_BITS-1:0]    bank_drain_data_r;
-            reg                    bank_drain_carry_r;
+            reg                    bank_drain_hi_r;
 
             always @(posedge clk) begin
                 if (rst) bank_drain_valid_r <= 1'b0;
@@ -454,7 +454,7 @@ module kr_klength_banked_top #(
                     if (drain_found) begin
                         bank_drain_tag_r   <= latch_tag[drain_sel];
                         bank_drain_data_r  <= latch_data[drain_sel];
-                        bank_drain_carry_r <= latch_carry[drain_sel];
+                        bank_drain_hi_r <= latch_hi[drain_sel];
                     end
                 end
             end
@@ -462,7 +462,7 @@ module kr_klength_banked_top #(
             assign bank_drain_valid[bi]                          = bank_drain_valid_r;
             assign bank_drain_tag[bi*TAG_BITS +: TAG_BITS]       = bank_drain_tag_r;
             assign bank_drain_data[bi*DATA_BITS +: DATA_BITS]    = bank_drain_data_r;
-            assign bank_drain_carry[bi]                          = bank_drain_carry_r;
+            assign bank_drain_hi[bi]                          = bank_drain_hi_r;
 
         end
     endgenerate
@@ -498,7 +498,7 @@ module kr_klength_banked_top #(
     reg                    result_valid_r;
     reg [TAG_BITS-1:0]     result_tag_r;
     reg [DATA_BITS-1:0]    result_data_r;
-    reg                    result_carry_r;
+    reg                    result_hi_r;
 
     always @(posedge clk) begin
         if (rst) result_valid_r <= 1'b0;
@@ -507,7 +507,7 @@ module kr_klength_banked_top #(
             if (merge_found) begin
                 result_tag_r   <= bank_drain_tag[merge_sel*TAG_BITS +: TAG_BITS];
                 result_data_r  <= bank_drain_data[merge_sel*DATA_BITS +: DATA_BITS];
-                result_carry_r <= bank_drain_carry[merge_sel];
+                result_hi_r <= bank_drain_hi[merge_sel];
             end
         end
     end
@@ -515,7 +515,7 @@ module kr_klength_banked_top #(
     assign result_valid = result_valid_r;
     assign result_tag   = result_tag_r;
     assign result_data  = result_data_r;
-    assign result_carry = result_carry_r;
+    assign result_hi = result_hi_r;
 
     // ===================================================================
     // Status
