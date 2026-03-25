@@ -46,14 +46,20 @@ theorem mpadd_correct (a b : List Nat) (c : Nat) (h : a.length = b.length) :
       mpn_value a + mpn_value b + c := by
   induction a, b, c using mpadd.induct with
   | case1 c => simp [mpadd, mpn_value]
-  | case2 a as b bs c ih =>
+  | case2 a as b bs c p_eq ih =>
+    -- p_eq : p = addwc a b c  (the let binding)
+    -- ih   : inductive hypothesis for the tail
     simp only [mpadd, mpn_value, List.length_cons]
     have hlen : as.length = bs.length := by simpa using h
     have hih := ih hlen
+    -- hih : mpn_value (mpadd as bs (addwc a b c).2).1
+    --         + (mpadd as bs (addwc a b c).2).2 * MOD ^ as.length
+    --       = mpn_value as + mpn_value bs + (addwc a b c).2
     have hspec := addwc_spec a b c
-    nlinarith [Nat.pow_succ MOD as.length]
+    -- hspec : (addwc a b c).1 + (addwc a b c).2 * MOD = a + b + c
+    rw [show as.length + 1 = as.length.succ from rfl, Nat.pow_succ]
+    nlinarith [hih, hspec, Nat.mul_comm MOD (MOD ^ as.length)]
   | case3 t x c hn hc =>
-    -- Catch-all case: mismatched lengths are impossible
     cases t with
     | nil =>
       cases x with
@@ -73,7 +79,7 @@ theorem mpadd_length (a b : List Nat) (c : Nat) (h : a.length = b.length) :
     (mpadd a b c).1.length = a.length := by
   induction a, b, c using mpadd.induct with
   | case1 c => simp [mpadd]
-  | case2 a as b bs c ih =>
+  | case2 a as b bs c p_eq ih =>
     simp only [mpadd, List.length_cons]
     have hlen : as.length = bs.length := by simpa using h
     exact congrArg (· + 1) (ih hlen)
@@ -99,16 +105,16 @@ def all_valid : List Nat → Prop
 
 /-- Each word in the mpadd result is < MOD, provided the inputs are valid. -/
 theorem mpadd_result_valid (a b : List Nat) (c : Nat)
-    (h : a.length = b.length) (_ha : all_valid a) (_hb : all_valid b) :
+    (h : a.length = b.length) (ha : all_valid a) (hb : all_valid b) :
     all_valid (mpadd a b c).1 := by
   induction a, b, c using mpadd.induct with
   | case1 c => simp [mpadd, all_valid]
-  | case2 a as b bs c ih =>
+  | case2 a as b bs c p_eq ih =>
     simp only [mpadd, all_valid]
     have hlen : as.length = bs.length := by simpa using h
     constructor
     · exact addwc_lo_lt a b c
-    · exact ih hlen _ha.2 _hb.2
+    · exact ih hlen ha.2 hb.2
   | case3 t x c hn hc =>
     cases t with
     | nil =>
