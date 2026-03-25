@@ -1,0 +1,43 @@
+# Vivado build artifacts
+vivado/output/
+*.jou
+*.log
+*.str
+*.xpr
+*.runs/
+*.cache/
+*.hw/
+*.ip_user_files/
+
+# Bitstream artifacts (committed separately when proven)
+*.bit
+*.bin
+*.mcs
+*.prm
+
+# Simulation
+*.vcd
+*.wdb
+*.wcfg
+
+# OS
+.DS_Store
+*~
+*.swp
+
+# Cloned repos (use git submodules if needed)
+neorv32/
+pari-gp/
+
+# Session notes (local only)
+sessions/
+
+# LaTeX build artifacts
+docs/*.aux
+docs/*.bbl
+docs/*.blg
+docs/*.out
+docs/*.toc
+docs/*.fdb_latexmk
+docs/*.fls
+docs/*.synctex.gz
