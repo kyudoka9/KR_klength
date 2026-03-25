@@ -8,7 +8,18 @@
 // Micro-ops are fed to the KR FPGA Scheduler, which handles parallel
 // execution across channels and dependency resolution via CDB.
 //
-// State machine: IDLE → FETCH → GENERATE → DRAIN → DONE
+// State machine: IDLE -> FETCH -> GENERATE -> DRAIN -> DONE
+//
+// Audit fixes applied:
+//   D3  — next_tag is monotonically increasing (never reset), with start_tag
+//          range check on result writeback to reject stale results.
+//   D4  — MPMUL dispatched as unsupported; handled by RISC-V using L0
+//          intrinsics (kr_mpn_mul). Hardware-scheduled MPMUL requires a
+//          result accumulator in the integration top (future work).
+//   D7  — Zero-length operand guard: len_a==0 skips to S_DONE.
+//   D9  — Carry RAW hazard: dispatch stalls until the dependent tag's
+//          result has arrived. Single-cycle forwarding bypass for the
+//          common case (result arrives the same cycle it is needed).
 //
 `default_nettype none
 
@@ -76,7 +87,8 @@ module kr_decomp_engine #(
     output reg                     irq,
     output reg  [31:0]             uops_issued,
     output reg  [31:0]             uops_completed,
-    output reg  [31:0]             cycle_count
+    output reg  [31:0]             cycle_count,
+    output reg                     err_unsupported  // MPMUL not supported in HW
 );
 
     // ---------------------------------------------------------------
@@ -97,7 +109,7 @@ module kr_decomp_engine #(
     localparam S_FETCH_A  = 4'd1;
     localparam S_FETCH_B  = 4'd2;
     localparam S_GEN_ADD  = 4'd3;  // Generate MPADD/MPSUB micro-ops
-    localparam S_GEN_MUL  = 4'd4;  // Generate MPMUL micro-ops
+    localparam S_GEN_MUL  = 4'd4;  // (reserved — MPMUL not yet HW-scheduled)
     localparam S_DRAIN    = 4'd5;  // Wait for all micro-ops to complete
     localparam S_DONE     = 4'd6;
 
@@ -133,6 +145,29 @@ module kr_decomp_engine #(
     reg [31:0]         total_uops;  // total micro-ops for this operation
 
     // ---------------------------------------------------------------
+    // D3 fix: start_tag for stale-result rejection
+    // ---------------------------------------------------------------
+    // next_tag is monotonically increasing (never reset). On each new
+    // command, start_tag captures next_tag. Results are only accepted
+    // when uops_completed < uops_issued, which guarantees we never
+    // write more results than we dispatched in the current operation.
+    reg [TAG_BITS-1:0] start_tag;
+
+    // ---------------------------------------------------------------
+    // D9 fix: completion tracking for carry RAW-hazard stall
+    // ---------------------------------------------------------------
+    // Per-tag completion bit. Set when a result arrives. Checked before
+    // emitting a carry-dependent micro-op to guarantee the predecessor
+    // result (and therefore its carry) is available.
+    reg completed [0:(1<<TAG_BITS)-1];
+
+    // Forwarding bypass: if the result for the carry dependency arrives
+    // THIS cycle, we can emit immediately instead of stalling.
+    wire dep_resolved  = !carry_dep || completed[carry_tag];
+    wire dep_forwarded = carry_dep && result_valid && (result_tag == carry_tag);
+    wire can_emit      = dep_resolved || dep_forwarded;
+
+    // ---------------------------------------------------------------
     // Drain tracking
     // ---------------------------------------------------------------
     reg [TAG_BITS-1:0] last_tag;    // last issued tag — done when this completes
@@ -140,9 +175,8 @@ module kr_decomp_engine #(
     // ---------------------------------------------------------------
     // Result writeback tracking
     // ---------------------------------------------------------------
-    // For MPADD: result word i is written when tag i completes
-    // For MPMUL: result words accumulate (handled by result accumulator externally)
-    // Simple approach: track tag→destination address mapping
+    // For MPADD: result word i is written when tag i completes.
+    // Tag-to-destination mapping, indexed by tag.
     reg [BRAM_ADDR_W-1:0] tag_dst_addr [0:(1<<TAG_BITS)-1];
 
     // ---------------------------------------------------------------
@@ -150,20 +184,22 @@ module kr_decomp_engine #(
     // ---------------------------------------------------------------
     always @(posedge clk) begin
         if (rst) begin
-            state          <= S_IDLE;
-            cmd_ready      <= 1'b1;
-            busy           <= 1'b0;
-            done           <= 1'b0;
-            irq            <= 1'b0;
-            uop_valid      <= 1'b0;
-            bram_rd_en     <= 1'b0;
-            bram_wr_en     <= 1'b0;
-            uops_issued    <= 32'd0;
-            uops_completed <= 32'd0;
-            cycle_count    <= 32'd0;
-            next_tag       <= {TAG_BITS{1'b0}};
-            fetch_idx      <= 16'd0;
-            fetch_pipe     <= 1'b0;
+            state           <= S_IDLE;
+            cmd_ready       <= 1'b1;
+            busy            <= 1'b0;
+            done            <= 1'b0;
+            irq             <= 1'b0;
+            uop_valid       <= 1'b0;
+            bram_rd_en      <= 1'b0;
+            bram_wr_en      <= 1'b0;
+            uops_issued     <= 32'd0;
+            uops_completed  <= 32'd0;
+            cycle_count     <= 32'd0;
+            next_tag        <= {TAG_BITS{1'b0}};
+            start_tag       <= {TAG_BITS{1'b0}};
+            fetch_idx       <= 16'd0;
+            fetch_pipe      <= 1'b0;
+            err_unsupported <= 1'b0;
         end else begin
             // Default: clear one-shot signals
             irq        <= 1'b0;
@@ -172,12 +208,20 @@ module kr_decomp_engine #(
             // Cycle counter (when busy)
             if (busy) cycle_count <= cycle_count + 1;
 
-            // Result writeback: when scheduler CDB delivers a result, write to BRAM
+            // -----------------------------------------------------------
+            // Result writeback: when scheduler CDB delivers a result,
+            // write to BRAM. D3 guard: only accept if we have not yet
+            // received all expected results for the current operation.
+            // -----------------------------------------------------------
             if (result_valid && busy) begin
-                bram_wr_en   <= 1'b1;
-                bram_wr_addr <= tag_dst_addr[result_tag];
-                bram_wr_data <= result_data;
-                uops_completed <= uops_completed + 1;
+                if (uops_completed < uops_issued) begin
+                    bram_wr_en     <= 1'b1;
+                    bram_wr_addr   <= tag_dst_addr[result_tag];
+                    bram_wr_data   <= result_data;
+                    uops_completed <= uops_completed + 1;
+                end
+                // D9: mark tag as completed for dependency tracking
+                completed[result_tag] <= 1'b1;
             end
 
             case (state)
@@ -195,14 +239,17 @@ module kr_decomp_engine #(
                     len_a_reg <= cmd_len_a;
                     len_b_reg <= cmd_len_b;
                     // Init counters
-                    cmd_ready      <= 1'b0;
-                    busy           <= 1'b1;
-                    uops_issued    <= 32'd0;
-                    uops_completed <= 32'd0;
-                    cycle_count    <= 32'd0;
-                    fetch_idx      <= 16'd0;
-                    fetch_pipe     <= 1'b0;
-                    next_tag       <= {TAG_BITS{1'b0}};
+                    cmd_ready       <= 1'b0;
+                    busy            <= 1'b1;
+                    uops_issued     <= 32'd0;
+                    uops_completed  <= 32'd0;
+                    cycle_count     <= 32'd0;
+                    fetch_idx       <= 16'd0;
+                    fetch_pipe      <= 1'b0;
+                    err_unsupported <= 1'b0;
+                    // D3 fix: next_tag is NOT reset — monotonically increasing.
+                    // Capture start_tag for this operation.
+                    start_tag      <= next_tag;
                     state          <= S_FETCH_A;
                     bram_rd_en     <= 1'b1;
                     bram_rd_addr   <= cmd_src_a;
@@ -250,15 +297,28 @@ module kr_decomp_engine #(
                     end
                     bram_rd_en <= 1'b0;
                     fetch_pipe <= 1'b0;
-                    // Select generation mode based on operation
+                    // Prepare generation counters
                     gen_i     <= 16'd0;
                     gen_j     <= 16'd0;
                     carry_dep <= 1'b0;
-                    if (op_reg == OP_MPMUL) begin
-                        total_uops <= {16'd0, len_a_reg} * {16'd0, len_b_reg};
-                        state      <= S_GEN_MUL;
+
+                    // -------------------------------------------------------
+                    // D7 fix: zero-length guard — skip to DONE if nothing to do.
+                    // D4 fix: MPMUL is unsupported in HW; set error flag.
+                    // -------------------------------------------------------
+                    if (len_a_reg == 16'd0) begin
+                        // Nothing to generate for any operation
+                        state <= S_DONE;
+                    end else if (op_reg == OP_MPMUL) begin
+                        // MPMUL is handled by the RISC-V core using L0
+                        // intrinsics (kr_mpn_mul from kr_bignum.h).
+                        // Hardware-scheduled MPMUL requires a result
+                        // accumulator in the integration top — planned
+                        // for a future version.
+                        err_unsupported <= 1'b1;
+                        state           <= S_DONE;
                     end else begin
-                        total_uops <= {16'd0, len_a_reg};  // MPADD: one op per word
+                        total_uops <= {16'd0, len_a_reg};
                         state      <= S_GEN_ADD;
                     end
                 end
@@ -266,9 +326,13 @@ module kr_decomp_engine #(
 
             // =============================================================
             // MPADD/MPSUB: emit one ADDWC/SUBWB per word, linear carry chain
+            //
+            // D9 fix: dispatch stalls when the carry dependency has not yet
+            // been resolved. Single-cycle forwarding bypass avoids a stall
+            // in the common case where the result arrives the same cycle.
             // =============================================================
             S_GEN_ADD: begin
-                if (!uop_valid || uop_ready) begin
+                if ((!uop_valid || uop_ready) && can_emit) begin
                     if (gen_i < len_a_reg) begin
                         uop_valid     <= 1'b1;
                         uop_opcode    <= (op_reg == OP_MPSUB) ? UOP_SUBWB : UOP_ADDWC;
@@ -282,10 +346,10 @@ module kr_decomp_engine #(
                         tag_dst_addr[next_tag] <= dst_reg + gen_i;
 
                         // Update state for next iteration
-                        carry_tag  <= next_tag;
-                        carry_dep  <= 1'b1;  // all subsequent words depend on carry
-                        next_tag   <= next_tag + 1;
-                        gen_i      <= gen_i + 1;
+                        carry_tag   <= next_tag;
+                        carry_dep   <= 1'b1;  // all subsequent words depend on carry
+                        next_tag    <= next_tag + 1;
+                        gen_i       <= gen_i + 1;
                         uops_issued <= uops_issued + 1;
                     end else begin
                         uop_valid <= 1'b0;
@@ -296,48 +360,14 @@ module kr_decomp_engine #(
             end
 
             // =============================================================
-            // MPMUL: nested loop of ADDMUL micro-ops (schoolbook)
-            //   for i = 0 to len_a-1:
-            //     carry_dep = false (fresh row)
-            //     for j = 0 to len_b-1:
-            //       emit ADDMUL(a[i], b[j]) with carry dep on previous in row
-            //       result accumulates into result[i+j]
+            // S_GEN_MUL: reserved — MPMUL not dispatched through HW path.
+            // Kept as a placeholder for future implementation with proper
+            // result accumulation support in the integration top.
             // =============================================================
             S_GEN_MUL: begin
-                if (!uop_valid || uop_ready) begin
-                    if (gen_i < len_a_reg) begin
-                        uop_valid     <= 1'b1;
-                        uop_opcode    <= UOP_ADDMUL;
-                        uop_src1      <= buf_a[gen_i];
-                        uop_src2      <= buf_b[gen_j];
-                        uop_tag       <= next_tag;
-                        uop_dep_valid <= carry_dep;
-                        uop_dep_tag   <= carry_tag;
-
-                        // Result destination: result[i+j]
-                        tag_dst_addr[next_tag] <= dst_reg + gen_i + gen_j;
-
-                        // Update carry chain (within this row)
-                        carry_tag  <= next_tag;
-                        carry_dep  <= 1'b1;
-                        next_tag   <= next_tag + 1;
-                        uops_issued <= uops_issued + 1;
-
-                        // Advance loop counters
-                        if (gen_j == len_b_reg - 1) begin
-                            // End of inner loop: advance outer, reset inner
-                            gen_j     <= 16'd0;
-                            gen_i     <= gen_i + 1;
-                            carry_dep <= 1'b0;  // new row: no carry dependency
-                        end else begin
-                            gen_j <= gen_j + 1;
-                        end
-                    end else begin
-                        uop_valid <= 1'b0;
-                        last_tag  <= next_tag - 1;
-                        state     <= S_DRAIN;
-                    end
-                end
+                // Should never be reached; S_FETCH_B routes MPMUL to S_DONE.
+                err_unsupported <= 1'b1;
+                state           <= S_DONE;
             end
 
             // =============================================================

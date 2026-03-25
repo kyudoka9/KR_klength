@@ -7,8 +7,8 @@
 //
 // Architecture:
 //   Decomp Engine → Tag Alloc → Bank Select (reg) → MAC Select (reg) → 384 MACs
-//   384 MACs → Per-Bank Latch+Drain (reg) → Inter-Bank Merge (reg) → Carry Table
-//   Carry Table → Decomp Engine (result writeback + carry resolution)
+//   384 MACs → Per-Bank Latch+Drain (reg) → Inter-Bank Merge (reg) → Hi Table
+//   Hi Table → Decomp Engine (result writeback + accumulator resolution)
 //
 `default_nettype none
 
@@ -82,20 +82,22 @@ module kr_klength_banked_top #(
 
     // ===================================================================
     // Result bus (from inter-bank merge → decomp engine)
+    // N2 fix: result_hi is full 32-bit high word, not 1-bit
     // ===================================================================
     wire                    result_valid;
     wire [TAG_BITS-1:0]     result_tag;
     wire [DATA_BITS-1:0]    result_data;
-    wire                    result_hi;
+    wire [DATA_BITS-1:0]    result_hi;
 
     // ===================================================================
     // Per-bank signals
+    // N2 fix: mac_result_hi widened to 32 bits per MAC
     // ===================================================================
     // MAC busy (flat across all banks)
     wire [N_TOTAL-1:0]                      mac_fu_busy;
     wire [N_TOTAL-1:0]                      mac_fu_valid;
     wire [N_TOTAL-1:0]                      mac_result_valid;
-    wire [N_TOTAL-1:0]                      mac_result_hi;
+    wire [N_TOTAL*DATA_BITS-1:0]            mac_result_hi;
     wire [N_TOTAL*DATA_BITS-1:0]            mac_result_data;
     wire [N_TOTAL*TAG_BITS-1:0]             mac_result_tag;
 
@@ -110,19 +112,26 @@ module kr_klength_banked_top #(
     endgenerate
 
     // ===================================================================
-    // Carry Resolution Table
+    // High-Word Resolution Table (N3 fix: was carry_table, now hi_table)
     // ===================================================================
-    reg carry_table [0:(1<<TAG_BITS)-1];
+    // Stores the full 32-bit high word from each completed micro-op.
+    // For ADDWC/SUBWB: only bit 0 is meaningful (carry/borrow).
+    // For MULFULL/ADDMUL: full 32-bit high word (accumulator for next op).
+    //
+    // Size: 2^TAG_BITS entries × 32 bits. For TAG_BITS=12: 128 KB (BRAM).
+    (* ram_style = "block" *)
+    reg [DATA_BITS-1:0] hi_table [0:(1<<TAG_BITS)-1];
 
     // Updated from registered result output (inter-bank merge)
     always @(posedge clk) begin
         if (result_valid)
-            carry_table[result_tag] <= result_hi;
+            hi_table[result_tag] <= result_hi;
     end
 
-    wire resolved_carry_in = (uop_dep_valid && uop_valid)
-                             ? carry_table[uop_dep_tag]
-                             : 1'b0;
+    // N3 fix: resolved_acc is full 32-bit, not 1-bit carry
+    wire [DATA_BITS-1:0] resolved_acc = (uop_dep_valid && uop_valid)
+                                        ? hi_table[uop_dep_tag]
+                                        : {DATA_BITS{1'b0}};
 
     // ===================================================================
     // BRAM Port A: Wishbone adapter (RISC-V side)
@@ -196,6 +205,7 @@ module kr_klength_banked_top #(
 
     // ===================================================================
     // Module: Decomposition Engine
+    // N4 fix: .result_carry(result_hi[0]) — decomp expects 1-bit carry
     // ===================================================================
     kr_decomp_engine #(
         .TAG_BITS (TAG_BITS), .DATA_BITS (DATA_BITS),
@@ -214,14 +224,16 @@ module kr_klength_banked_top #(
         .uop_opcode (uop_opcode), .uop_src1 (uop_src1), .uop_src2 (uop_src2),
         .uop_tag (uop_tag), .uop_dep_valid (uop_dep_valid), .uop_dep_tag (uop_dep_tag),
         .result_valid (result_valid), .result_tag (result_tag),
-        .result_data (result_data), .result_hi (result_hi),
+        .result_data (result_data), .result_carry (result_hi[0]),
         .busy (de_busy), .done (de_done), .irq (de_irq),
         .uops_issued (de_uops_issued), .uops_completed (de_uops_completed),
-        .cycle_count (de_cycle_count)
+        .cycle_count (de_cycle_count),
+        .err_unsupported (de_err_unsupported)
     );
 
     // ===================================================================
     // Stage 1: Bank Selection (registered)
+    // N3 fix: s1_acc is full 32-bit accumulator (was 1-bit s1_carry_in)
     // ===================================================================
     reg [BANK_BITS-1:0]    s1_bank_rr;     // round-robin bank pointer
     reg [BANK_BITS-1:0]    s1_bank_sel;     // selected bank
@@ -229,7 +241,7 @@ module kr_klength_banked_top #(
     reg [3:0]              s1_opcode;
     reg [DATA_BITS-1:0]    s1_src1, s1_src2;
     reg [TAG_BITS-1:0]     s1_tag;
-    reg                    s1_carry_in;
+    reg [DATA_BITS-1:0]    s1_acc;
 
     // Find a free bank (combinational, starting from round-robin pointer)
     reg [BANK_BITS-1:0]    s1_bank_found;
@@ -270,7 +282,7 @@ module kr_klength_banked_top #(
                 s1_src1     <= uop_src1;
                 s1_src2     <= uop_src2;
                 s1_tag      <= uop_tag;
-                s1_carry_in <= resolved_carry_in;
+                s1_acc      <= resolved_acc;
                 s1_bank_rr  <= (s1_bank_found + 1) % N_BANKS;
             end
         end
@@ -278,6 +290,7 @@ module kr_klength_banked_top #(
 
     // ===================================================================
     // Stage 2: Intra-Bank MAC Selection (registered)
+    // N3 fix: s2_acc is full 32-bit accumulator (was 1-bit s2_carry_in)
     // ===================================================================
     reg [BANK_BITS-1:0]    s2_bank;
     reg [CH_BITS-1:0]      s2_mac;
@@ -285,7 +298,7 @@ module kr_klength_banked_top #(
     reg [3:0]              s2_opcode;
     reg [DATA_BITS-1:0]    s2_src1, s2_src2;
     reg [TAG_BITS-1:0]     s2_tag;
-    reg                    s2_carry_in;
+    reg [DATA_BITS-1:0]    s2_acc;
 
     // Per-bank round-robin MAC pointers
     reg [CH_BITS-1:0] mac_rr [0:N_BANKS-1];
@@ -329,7 +342,7 @@ module kr_klength_banked_top #(
                 s2_src1     <= s1_src1;
                 s2_src2     <= s1_src2;
                 s2_tag      <= s1_tag;
-                s2_carry_in <= s1_carry_in;
+                s2_acc      <= s1_acc;
                 mac_rr[s1_bank_sel] <= (s2_mac_found + 1) % CH_PER_BANK;
             end
         end
@@ -337,6 +350,11 @@ module kr_klength_banked_top #(
 
     // ===================================================================
     // MAC Functional Unit Bank: 384 instances
+    // N1 fix: ports match redesigned kr_klength_fu_mac
+    //   - Removed fu_dest_reg, fu_imm, result_dest_reg (don't exist)
+    //   - Added fu_acc (32-bit accumulator)
+    //   - result_hi uses 32-bit slice, not 1-bit index
+    //   - result_opcode left open (unused)
     // ===================================================================
     // Drive fu_valid to exactly one MAC based on stage 2 selection
     generate
@@ -361,14 +379,12 @@ module kr_klength_banked_top #(
                     .fu_src1        (s2_src1),
                     .fu_src2        (s2_src2),
                     .fu_tag         (s2_tag),
-                    .fu_dest_reg    (5'd0),
-                    .fu_imm         ({12'd0, s2_carry_in}),
+                    .fu_acc         (s2_acc),
                     .result_valid   (mac_result_valid[IDX]),
                     .result_tag     (mac_result_tag[IDX*TAG_BITS +: TAG_BITS]),
                     .result_data    (mac_result_data[IDX*DATA_BITS +: DATA_BITS]),
-                    .result_dest_reg(),
+                    .result_hi      (mac_result_hi[IDX*DATA_BITS +: DATA_BITS]),
                     .result_opcode  (),
-                    .result_hi   (mac_result_hi[IDX]),
                     .fu_busy        (mac_fu_busy[IDX])
                 );
             end
@@ -377,6 +393,7 @@ module kr_klength_banked_top #(
 
     // ===================================================================
     // Per-Bank Result Latch + Drain
+    // N2 fix: all hi signals widened to 32 bits
     // ===================================================================
     // Each bank latches its 48 MAC results independently.
     // Per-bank round-robin drain produces 1 result/cycle per bank.
@@ -384,16 +401,17 @@ module kr_klength_banked_top #(
     wire [N_BANKS-1:0]                 bank_drain_valid;
     wire [N_BANKS*TAG_BITS-1:0]        bank_drain_tag;
     wire [N_BANKS*DATA_BITS-1:0]       bank_drain_data;
-    wire [N_BANKS-1:0]                 bank_drain_hi;
+    wire [N_BANKS*DATA_BITS-1:0]       bank_drain_hi;
 
     generate
         for (bi = 0; bi < N_BANKS; bi = bi + 1) begin : gen_bank_collect
 
             // Per-MAC result latches within this bank
+            // N2 fix: latch_hi is an array of DATA_BITS-wide regs
             reg [CH_PER_BANK-1:0]   latch_valid;
             reg [TAG_BITS-1:0]      latch_tag   [0:CH_PER_BANK-1];
             reg [DATA_BITS-1:0]     latch_data  [0:CH_PER_BANK-1];
-            reg [CH_PER_BANK-1:0]   latch_hi;
+            reg [DATA_BITS-1:0]     latch_hi    [0:CH_PER_BANK-1];
 
             reg [CH_BITS-1:0]       drain_rr;
             reg [CH_BITS-1:0]       drain_sel;
@@ -404,14 +422,13 @@ module kr_klength_banked_top #(
                 integer k;
                 if (rst) begin
                     latch_valid <= {CH_PER_BANK{1'b0}};
-                    latch_hi <= {CH_PER_BANK{1'b0}};
                 end else begin
                     for (k = 0; k < CH_PER_BANK; k = k + 1) begin
                         if (mac_result_valid[bi*CH_PER_BANK + k]) begin
                             latch_valid[k] <= 1'b1;
                             latch_tag[k]   <= mac_result_tag[(bi*CH_PER_BANK+k)*TAG_BITS +: TAG_BITS];
                             latch_data[k]  <= mac_result_data[(bi*CH_PER_BANK+k)*DATA_BITS +: DATA_BITS];
-                            latch_hi[k] <= mac_result_hi[bi*CH_PER_BANK + k];
+                            latch_hi[k]    <= mac_result_hi[(bi*CH_PER_BANK+k)*DATA_BITS +: DATA_BITS];
                         end
                         // Clear when drained
                         if (drain_found && drain_sel == k)
@@ -442,10 +459,11 @@ module kr_klength_banked_top #(
             end
 
             // Registered bank drain output
+            // N2 fix: bank_drain_hi_r widened to DATA_BITS
             reg                    bank_drain_valid_r;
             reg [TAG_BITS-1:0]     bank_drain_tag_r;
             reg [DATA_BITS-1:0]    bank_drain_data_r;
-            reg                    bank_drain_hi_r;
+            reg [DATA_BITS-1:0]    bank_drain_hi_r;
 
             always @(posedge clk) begin
                 if (rst) bank_drain_valid_r <= 1'b0;
@@ -454,7 +472,7 @@ module kr_klength_banked_top #(
                     if (drain_found) begin
                         bank_drain_tag_r   <= latch_tag[drain_sel];
                         bank_drain_data_r  <= latch_data[drain_sel];
-                        bank_drain_hi_r <= latch_hi[drain_sel];
+                        bank_drain_hi_r    <= latch_hi[drain_sel];
                     end
                 end
             end
@@ -462,7 +480,7 @@ module kr_klength_banked_top #(
             assign bank_drain_valid[bi]                          = bank_drain_valid_r;
             assign bank_drain_tag[bi*TAG_BITS +: TAG_BITS]       = bank_drain_tag_r;
             assign bank_drain_data[bi*DATA_BITS +: DATA_BITS]    = bank_drain_data_r;
-            assign bank_drain_hi[bi]                          = bank_drain_hi_r;
+            assign bank_drain_hi[bi*DATA_BITS +: DATA_BITS]      = bank_drain_hi_r;
 
         end
     endgenerate
@@ -495,10 +513,11 @@ module kr_klength_banked_top #(
     end
 
     // Final registered result output
+    // N2 fix: result_hi_r widened to DATA_BITS
     reg                    result_valid_r;
     reg [TAG_BITS-1:0]     result_tag_r;
     reg [DATA_BITS-1:0]    result_data_r;
-    reg                    result_hi_r;
+    reg [DATA_BITS-1:0]    result_hi_r;
 
     always @(posedge clk) begin
         if (rst) result_valid_r <= 1'b0;
@@ -507,7 +526,7 @@ module kr_klength_banked_top #(
             if (merge_found) begin
                 result_tag_r   <= bank_drain_tag[merge_sel*TAG_BITS +: TAG_BITS];
                 result_data_r  <= bank_drain_data[merge_sel*DATA_BITS +: DATA_BITS];
-                result_hi_r <= bank_drain_hi[merge_sel];
+                result_hi_r    <= bank_drain_hi[merge_sel*DATA_BITS +: DATA_BITS];
             end
         end
     end
@@ -515,7 +534,7 @@ module kr_klength_banked_top #(
     assign result_valid = result_valid_r;
     assign result_tag   = result_tag_r;
     assign result_data  = result_data_r;
-    assign result_hi = result_hi_r;
+    assign result_hi    = result_hi_r;
 
     // ===================================================================
     // Status

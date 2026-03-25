@@ -76,6 +76,7 @@ module kr_klength_top #(
     wire [31:0]             de_uops_issued;
     wire [31:0]             de_uops_completed;
     wire [31:0]             de_cycle_count;
+    wire                    de_err_unsupported;
 
     // ===================================================================
     // Internal wires: Decomposition engine ↔ BRAM (port B)
@@ -283,7 +284,8 @@ module kr_klength_top #(
         .irq              (de_irq),
         .uops_issued      (de_uops_issued),
         .uops_completed   (de_uops_completed),
-        .cycle_count      (de_cycle_count)
+        .cycle_count      (de_cycle_count),
+        .err_unsupported  (de_err_unsupported)
     );
 
     // ===================================================================
