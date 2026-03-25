@@ -19,6 +19,8 @@
 //   0x2C: WATCHDOG_STATUS [RO]  Bit 0: timeout_alert, Bit 1: all_complete
 //   0x30: MISSING_COUNT   [RO]  Number of incomplete micro-ops
 //   0x34: TIMEOUT_TAG     [RO]  Tag that timed out
+//   0x38: SPEC_CORRECT    [RO]  Speculation correct predictions (Phase E)
+//   0x3C: SPEC_REPLAYS    [RO]  Speculation replay count (Phase E)
 //
 `default_nettype none
 
@@ -65,7 +67,13 @@ module kr_klength_regs #(
     input  wire                    wd_timeout_alert,
     input  wire                    wd_all_complete,
     input  wire [31:0]             wd_missing_count,
-    input  wire [11:0]             wd_timeout_tag
+    input  wire [11:0]             wd_timeout_tag,
+
+    // ---------------------------------------------------------------
+    // Speculation statistics (Phase E, from decomp engine)
+    // ---------------------------------------------------------------
+    input  wire [31:0]             de_speculation_correct,
+    input  wire [31:0]             de_speculation_replays
 );
 
     localparam MAGIC = 32'h4B4C454E;  // "KLEN"
@@ -128,6 +136,8 @@ module kr_klength_regs #(
             5'd11: wb_dat_o = {30'd0, wd_all_complete, wd_timeout_alert};  // WATCHDOG_STATUS
             5'd12: wb_dat_o = wd_missing_count;                             // MISSING_COUNT
             5'd13: wb_dat_o = {20'd0, wd_timeout_tag};                      // TIMEOUT_TAG
+            5'd14: wb_dat_o = de_speculation_correct;                         // SPEC_CORRECT
+            5'd15: wb_dat_o = de_speculation_replays;                         // SPEC_REPLAYS
             default: wb_dat_o = 32'd0;
         endcase
     end

@@ -58,6 +58,9 @@ module kr_klength_banked_top #(
     wire [15:0]             cmd_len_a, cmd_len_b;
     wire                    de_busy, de_done, de_irq;
     wire [31:0]             de_uops_issued, de_uops_completed, de_cycle_count;
+    wire                    de_err_unsupported;
+    // Phase E: Speculation statistics from decomp engine
+    wire [31:0]             de_speculation_correct, de_speculation_replays;
 
     // ===================================================================
     // BRAM interface
@@ -200,7 +203,13 @@ module kr_klength_banked_top #(
         .cmd_len_a (cmd_len_a), .cmd_len_b (cmd_len_b),
         .de_busy (de_busy), .de_done (de_done),
         .de_uops_issued (de_uops_issued), .de_uops_completed (de_uops_completed),
-        .de_cycle_count (de_cycle_count)
+        .de_cycle_count (de_cycle_count),
+        // Watchdog status (tied off — instantiate separately if needed)
+        .wd_timeout_alert (1'b0), .wd_all_complete (1'b0),
+        .wd_missing_count (32'd0), .wd_timeout_tag (12'd0),
+        // Phase E: Speculation statistics
+        .de_speculation_correct (de_speculation_correct),
+        .de_speculation_replays (de_speculation_replays)
     );
 
     // ===================================================================
@@ -209,7 +218,8 @@ module kr_klength_banked_top #(
     // ===================================================================
     kr_decomp_engine #(
         .TAG_BITS (TAG_BITS), .DATA_BITS (DATA_BITS),
-        .MAX_WORDS (MAX_WORDS), .BRAM_ADDR_W (BRAM_ADDR_W)
+        .MAX_WORDS (MAX_WORDS), .BRAM_ADDR_W (BRAM_ADDR_W),
+        .SPECULATIVE_CARRY(1)  // Phase E: speculative carry prediction
     ) u_decomp (
         .clk (clk), .rst (rst),
         .cmd_valid (cmd_valid), .cmd_ready (cmd_ready),
@@ -228,7 +238,10 @@ module kr_klength_banked_top #(
         .busy (de_busy), .done (de_done), .irq (de_irq),
         .uops_issued (de_uops_issued), .uops_completed (de_uops_completed),
         .cycle_count (de_cycle_count),
-        .err_unsupported (de_err_unsupported)
+        .err_unsupported (de_err_unsupported),
+        // Phase E: Speculation statistics
+        .speculation_correct (de_speculation_correct),
+        .speculation_replays (de_speculation_replays)
     );
 
     // ===================================================================
