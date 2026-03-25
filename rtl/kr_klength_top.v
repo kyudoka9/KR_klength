@@ -107,7 +107,7 @@ module kr_klength_top #(
     wire                    result_valid;
     wire [TAG_BITS-1:0]     result_tag;
     wire [DATA_BITS-1:0]    result_data;
-    wire                    result_carry;
+    wire [DATA_BITS-1:0]    result_hi;  // full 32-bit high word (was 1-bit carry)
 
     // ===================================================================
     // Per-MAC-unit wires
@@ -115,32 +115,32 @@ module kr_klength_top #(
     wire [N_CHANNELS-1:0]   mac_fu_valid;
     wire [N_CHANNELS-1:0]   mac_result_valid;
     wire [N_CHANNELS-1:0]   mac_fu_busy;
-    wire [N_CHANNELS-1:0]   mac_result_carry;
+    wire [N_CHANNELS*DATA_BITS-1:0] mac_result_hi;   // 32-bit high word per MAC
     wire [N_CHANNELS*DATA_BITS-1:0] mac_result_data;
     wire [N_CHANNELS*TAG_BITS-1:0]  mac_result_tag;
 
     // ===================================================================
-    // Carry Resolution Table
+    // High-Word Resolution Table (was carry table)
     // ===================================================================
-    // When a MAC completes with a carry, store the carry bit indexed by tag.
-    // When a subsequent micro-op depends on that tag (uop_dep_valid=1,
-    // uop_dep_tag=T), look up carry_table[T] to get the carry-in value.
+    // Stores the full 32-bit high word from each completed micro-op.
+    // For ADDWC/SUBWB: only bit 0 is meaningful (carry/borrow).
+    // For MULFULL/ADDMUL: full 32-bit high word (accumulator for next op).
     //
-    // Size: 2^TAG_BITS entries × 1 bit = 1024 bits = 128 bytes (LUT RAM).
-    reg carry_table [0:(1<<TAG_BITS)-1];
+    // Size: 2^TAG_BITS entries × 32 bits. For TAG_BITS=10: 32 KB (BRAM).
+    (* ram_style = "block" *)
+    reg [DATA_BITS-1:0] hi_table [0:(1<<TAG_BITS)-1];
 
-    // Update carry table when results arrive
-    // (uses the registered result_valid/tag/carry from the collector)
+    // Update table when results arrive
     always @(posedge clk) begin
         if (result_valid_r) begin
-            carry_table[result_tag_r] <= result_carry_r;
+            hi_table[result_tag_r] <= result_hi_r;
         end
     end
 
-    // Resolved carry-in for the current micro-op being dispatched
-    wire resolved_carry_in = (uop_dep_valid && uop_valid)
-                             ? carry_table[uop_dep_tag]
-                             : 1'b0;
+    // Resolved accumulator/carry-in for the current micro-op being dispatched
+    wire [DATA_BITS-1:0] resolved_acc = (uop_dep_valid && uop_valid)
+                                        ? hi_table[uop_dep_tag]
+                                        : {DATA_BITS{1'b0}};
 
     // ===================================================================
     // BRAM port A: Wishbone adapter (RISC-V side)
@@ -276,7 +276,7 @@ module kr_klength_top #(
         .result_valid     (result_valid),
         .result_tag       (result_tag),
         .result_data      (result_data),
-        .result_carry     (result_carry),
+        .result_carry     (result_hi[0]),  // MPADD uses bit 0 as carry flag
         // Status
         .busy             (de_busy),
         .done             (de_done),
@@ -354,15 +354,13 @@ module kr_klength_top #(
                 .fu_src1        (uop_src1),
                 .fu_src2        (uop_src2),
                 .fu_tag         (uop_tag),
-                .fu_dest_reg    (5'd0),
-                .fu_imm         ({12'd0, resolved_carry_in}),
+                .fu_acc         (resolved_acc),
                 // Result output
                 .result_valid   (mac_result_valid[gi]),
                 .result_tag     (mac_result_tag[gi*TAG_BITS +: TAG_BITS]),
                 .result_data    (mac_result_data[gi*DATA_BITS +: DATA_BITS]),
-                .result_dest_reg(),  // unused in k-length, left open
+                .result_hi      (mac_result_hi[gi*DATA_BITS +: DATA_BITS]),
                 .result_opcode  (),  // unused in k-length, left open
-                .result_carry   (mac_result_carry[gi]),
                 // Busy status
                 .fu_busy        (mac_fu_busy[gi])
             );
@@ -383,25 +381,24 @@ module kr_klength_top #(
     // worst case is 8 simultaneous completions drained in 8 cycles —
     // well before any MAC can produce a new result.
 
-    // Per-MAC result latches
+    // Per-MAC result latches (32-bit hi per channel)
     reg [N_CHANNELS-1:0]   mac_latch_valid;
     reg [TAG_BITS-1:0]     mac_latch_tag   [0:N_CHANNELS-1];
     reg [DATA_BITS-1:0]    mac_latch_data  [0:N_CHANNELS-1];
-    reg [N_CHANNELS-1:0]   mac_latch_carry;
+    reg [DATA_BITS-1:0]    mac_latch_hi    [0:N_CHANNELS-1];
 
     // Latch incoming results
     always @(posedge clk) begin : latch_results
         integer k;
         if (rst) begin
             mac_latch_valid <= {N_CHANNELS{1'b0}};
-            mac_latch_carry <= {N_CHANNELS{1'b0}};
         end else begin
             for (k = 0; k < N_CHANNELS; k = k + 1) begin
                 if (mac_result_valid[k]) begin
                     mac_latch_valid[k] <= 1'b1;
                     mac_latch_tag[k]   <= mac_result_tag[k*TAG_BITS +: TAG_BITS];
                     mac_latch_data[k]  <= mac_result_data[k*DATA_BITS +: DATA_BITS];
-                    mac_latch_carry[k] <= mac_result_carry[k];
+                    mac_latch_hi[k]    <= mac_result_hi[k*DATA_BITS +: DATA_BITS];
                 end
                 // Clear latch when drained by arbiter
                 if (drain_valid && drain_sel == k) begin
@@ -441,7 +438,7 @@ module kr_klength_top #(
     reg                    result_valid_r;
     reg [TAG_BITS-1:0]     result_tag_r;
     reg [DATA_BITS-1:0]    result_data_r;
-    reg                    result_carry_r;
+    reg [DATA_BITS-1:0]    result_hi_r;
 
     always @(posedge clk) begin
         if (rst) begin
@@ -451,7 +448,7 @@ module kr_klength_top #(
             if (drain_valid) begin
                 result_tag_r   <= mac_latch_tag[drain_sel];
                 result_data_r  <= mac_latch_data[drain_sel];
-                result_carry_r <= mac_latch_carry[drain_sel];
+                result_hi_r    <= mac_latch_hi[drain_sel];
             end
         end
     end
@@ -459,7 +456,7 @@ module kr_klength_top #(
     assign result_valid = result_valid_r;
     assign result_tag   = result_tag_r;
     assign result_data  = result_data_r;
-    assign result_carry = result_carry_r;
+    assign result_hi    = result_hi_r;
 
     // ===================================================================
     // Status outputs

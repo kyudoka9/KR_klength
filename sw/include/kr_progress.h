@@ -165,7 +165,12 @@ static inline kr_algo_progress_t kr_algo_progress(const kr_algo_tracker_t *t) {
     if (t->steps_expected > 0) {
         p.percent = (t->steps_done * 100) / t->steps_expected;
         if (p.avg_step_ms > 0 && t->steps_expected > t->steps_done) {
-            p.eta_ms = (t->steps_expected - t->steps_done) * p.avg_step_ms;
+            // Use uint64_t to avoid overflow: e.g. 500000 steps * 60000 ms
+            // would overflow uint32_t (max ~4.29 billion)
+            uint64_t eta64 = (uint64_t)(t->steps_expected - t->steps_done)
+                             * (uint64_t)p.avg_step_ms;
+            // Cap at UINT32_MAX (~49 days in ms) to fit in the struct field
+            p.eta_ms = (eta64 > UINT32_MAX) ? UINT32_MAX : (uint32_t)eta64;
         } else {
             p.eta_ms = 0;
         }
@@ -186,7 +191,14 @@ static inline kr_algo_progress_t kr_algo_progress(const kr_algo_tracker_t *t) {
 
 // Format milliseconds as human-readable time string.
 // Writes to caller's buffer. Returns pointer to buf.
+// Requires buflen >= 12 for worst case "99h 59m 59s\0".
+// Hours are capped at 99 to prevent buffer overrun from multi-digit hours.
 static inline char *kr_format_eta(uint32_t ms, char *buf, int buflen) {
+    if (buflen < 2 || buf == (char *)0) {
+        // Can't even write "-\0", return empty if possible
+        if (buf && buflen >= 1) buf[0] = '\0';
+        return buf;
+    }
     if (ms == 0) {
         buf[0] = '-'; buf[1] = '\0';
         return buf;
@@ -196,9 +208,12 @@ static inline char *kr_format_eta(uint32_t ms, char *buf, int buflen) {
     uint32_t hr  = min / 60;
     sec %= 60;
     min %= 60;
+    // Cap hours at 99 to prevent buffer overrun with large values
+    if (hr > 99) hr = 99;
 
     if (hr > 0) {
-        // "2h 14m 30s"
+        // "99h 59m 59s\0" = 12 chars max
+        if (buflen < 12) { buf[0] = '?'; buf[1] = '\0'; return buf; }
         int i = 0;
         if (hr >= 10) buf[i++] = '0' + (hr / 10);
         buf[i++] = '0' + (hr % 10);
@@ -210,7 +225,8 @@ static inline char *kr_format_eta(uint32_t ms, char *buf, int buflen) {
         buf[i++] = '0' + (sec % 10);
         buf[i++] = 's'; buf[i] = '\0';
     } else if (min > 0) {
-        // "14m 30s"
+        // "59m 59s\0" = 8 chars max
+        if (buflen < 8) { buf[0] = '?'; buf[1] = '\0'; return buf; }
         int i = 0;
         if (min >= 10) buf[i++] = '0' + (min / 10);
         buf[i++] = '0' + (min % 10);
@@ -219,7 +235,8 @@ static inline char *kr_format_eta(uint32_t ms, char *buf, int buflen) {
         buf[i++] = '0' + (sec % 10);
         buf[i++] = 's'; buf[i] = '\0';
     } else {
-        // "30s"
+        // "59s\0" = 4 chars max
+        if (buflen < 4) { buf[0] = '?'; buf[1] = '\0'; return buf; }
         int i = 0;
         if (sec >= 10) buf[i++] = '0' + (sec / 10);
         buf[i++] = '0' + (sec % 10);

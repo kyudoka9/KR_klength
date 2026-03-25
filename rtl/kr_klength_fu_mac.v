@@ -1,39 +1,47 @@
 // Copyright 2026 Kyudoka Research, H. Ismail <ismh@kyudoka.org>
 // KR k-Length Computing — DSP48E1 Multiply-Accumulate Functional Unit
 //
-// Replaces the pass-through FU from the routing scheduler with a real
-// arithmetic unit backed by DSP48E1. Supports ADDWC, SUBWB, ADDMUL,
-// MULFULL, and CLZ operations.
+// Redesigned to fix audit bugs M1, M2c, M2d, M3, M4, M5.
 //
-// Pipeline: 3 stages for multiply (DSP48E1 inference), 1 stage for add/sub/clz.
+// Pipeline (unified — all ops go through registered stages):
+//   Stage 1: Capture inputs. ADDWC/SUBWB/CLZ compute result combinationally.
+//   Stage 2: MULFULL/ADDMUL multiply (DSP48E1 inference). Add/sub/clz skip.
+//   Stage 3: Final output register. Multiply accumulate (product + acc).
+//
+// Latency:  ADDWC/SUBWB/CLZ = 2 cycles (s1 → s3).
+//           MULFULL/ADDMUL  = 3 cycles (s1 → s2 → s3).
+//
+// fu_busy is asserted whenever ANY stage holds valid data (fixes M5).
+// All ops go through the pipeline — no bypass path (fixes M1).
+// result_hi is full 32-bit high word, not 1-bit carry (fixes M4, M2c).
+// ADDMUL computes src1*src2 + acc (fixes M2d).
+// Multiply uses src1 * src2 directly for DSP48E1 inference (fixes M3).
 //
 `default_nettype none
 
 module kr_klength_fu_mac #(
-    parameter TAG_BITS  = 10,
+    parameter TAG_BITS  = 12,
     parameter DATA_BITS = 32
 ) (
     input  wire                    clk,
     input  wire                    rst,
 
-    // Issue interface (from RS table)
+    // Issue interface
     input  wire                    fu_valid,
     input  wire [3:0]              fu_opcode,
     input  wire [DATA_BITS-1:0]    fu_src1,
     input  wire [DATA_BITS-1:0]    fu_src2,
     input  wire [TAG_BITS-1:0]     fu_tag,
-    input  wire [4:0]              fu_dest_reg,
-    input  wire [12:0]             fu_imm,        // carry_in from dependency (bit 0)
+    input  wire [DATA_BITS-1:0]    fu_acc,       // accumulator / carry-in
 
     // Result output
     output reg                     result_valid,
     output reg  [TAG_BITS-1:0]     result_tag,
-    output reg  [DATA_BITS-1:0]    result_data,
-    output reg  [4:0]              result_dest_reg,
+    output reg  [DATA_BITS-1:0]    result_data,  // low word
+    output reg  [DATA_BITS-1:0]    result_hi,    // high word / carry
     output reg  [3:0]              result_opcode,
-    output reg                     result_carry,   // carry/borrow output
 
-    // Busy status
+    // Busy
     output wire                    fu_busy
 );
 
@@ -44,40 +52,9 @@ module kr_klength_fu_mac #(
     localparam OP_ADDMUL  = 4'd3;
     localparam OP_CLZ     = 4'd5;
 
-    // ---------------------------------------------------------------
-    // Pipeline stage 1: capture operands, start computation
-    // ---------------------------------------------------------------
-    reg                    s1_valid;
-    reg [3:0]              s1_opcode;
-    reg [DATA_BITS-1:0]    s1_src1, s1_src2;
-    reg [TAG_BITS-1:0]     s1_tag;
-    reg [4:0]              s1_dest_reg;
-    reg                    s1_carry_in;
-
-    // ---------------------------------------------------------------
-    // Pipeline stage 2: multiply result available (DSP48E1 latency)
-    // ---------------------------------------------------------------
-    reg                    s2_valid;
-    reg [3:0]              s2_opcode;
-    reg [TAG_BITS-1:0]     s2_tag;
-    reg [4:0]              s2_dest_reg;
-    reg [63:0]             s2_product;    // 32x32 -> 64 result
-    reg [DATA_BITS-1:0]    s2_add_result; // for ADDWC/SUBWB (forwarded from s1)
-    reg                    s2_add_carry;
-    reg [DATA_BITS-1:0]    s2_clz_result;
-
-    // ---------------------------------------------------------------
-    // Pipeline stage 3: output register
-    // ---------------------------------------------------------------
-    // (result_valid, result_tag, result_data, result_carry are the output regs)
-
-    // Busy when any multiply is in the pipeline
-    // ADDWC/SUBWB/CLZ complete in 1 cycle (bypass to output)
-    assign fu_busy = s1_valid | s2_valid;
-
-    // ---------------------------------------------------------------
+    // -------------------------------------------------------------------
     // CLZ: count leading zeros (combinational)
-    // ---------------------------------------------------------------
+    // -------------------------------------------------------------------
     function [5:0] clz32;
         input [31:0] x;
         reg [5:0] n;
@@ -93,72 +70,213 @@ module kr_klength_fu_mac #(
         end
     endfunction
 
-    // ---------------------------------------------------------------
-    // Stage 1: Capture + single-cycle operations
-    // ---------------------------------------------------------------
+    // -------------------------------------------------------------------
+    // Classify opcode: is it a multiply (3-stage) or simple (2-stage)?
+    // -------------------------------------------------------------------
+    wire fu_is_mul = (fu_opcode == OP_MULFULL) || (fu_opcode == OP_ADDMUL);
+
+    // -------------------------------------------------------------------
+    // Stage 1: Capture inputs. Compute add/sub/clz combinationally.
+    // -------------------------------------------------------------------
+    reg                    s1_valid;
+    reg [3:0]              s1_opcode;
+    reg [DATA_BITS-1:0]    s1_src1, s1_src2;
+    reg [TAG_BITS-1:0]     s1_tag;
+    reg [DATA_BITS-1:0]    s1_acc;
+    reg                    s1_is_mul;
+
+    // Pre-computed simple-op results (registered in s1)
+    reg [DATA_BITS-1:0]    s1_simple_data;
+    reg [DATA_BITS-1:0]    s1_simple_hi;
+
+    // -------------------------------------------------------------------
+    // Stage 2: Multiply (DSP48E1). Only valid for MULFULL/ADDMUL.
+    // -------------------------------------------------------------------
+    reg                    s2_valid;
+    reg [3:0]              s2_opcode;
+    reg [TAG_BITS-1:0]     s2_tag;
+    reg [DATA_BITS-1:0]    s2_acc;
+    reg [63:0]             s2_product;
+
+    // For simple ops skipping s2: forwarded from s1
+    reg                    s2_simple_valid;
+    reg [3:0]              s2_simple_opcode;
+    reg [TAG_BITS-1:0]     s2_simple_tag;
+    reg [DATA_BITS-1:0]    s2_simple_data;
+    reg [DATA_BITS-1:0]    s2_simple_hi;
+
+    // -------------------------------------------------------------------
+    // Busy: any stage has valid data (fixes M5)
+    // -------------------------------------------------------------------
+    assign fu_busy = s1_valid | s2_valid | s2_simple_valid | hold_valid;
+
+    // -------------------------------------------------------------------
+    // Stage 1: Capture
+    // -------------------------------------------------------------------
+    // Combinational add/sub/clz results (used for registering into s1)
+    reg [DATA_BITS:0] add_result_wide;  // 33 bits for carry
+    reg [DATA_BITS:0] sub_result_wide;  // 33 bits for borrow
+
+    always @(*) begin
+        // ADDWC: {carry, sum} = src1 + src2 + acc[0]
+        add_result_wide = {1'b0, fu_src1} + {1'b0, fu_src2} + {32'd0, fu_acc[0]};
+        // SUBWB: {borrow, diff} = src1 - src2 - acc[0]
+        sub_result_wide = {1'b0, fu_src1} - {1'b0, fu_src2} - {32'd0, fu_acc[0]};
+    end
+
     always @(posedge clk) begin
         if (rst) begin
-            s1_valid    <= 1'b0;
-            s2_valid    <= 1'b0;
-            result_valid <= 1'b0;
+            s1_valid <= 1'b0;
         end else begin
-            // Default: clear outputs
-            result_valid <= 1'b0;
+            if (fu_valid) begin
+                s1_valid  <= 1'b1;
+                s1_opcode <= fu_opcode;
+                s1_src1   <= fu_src1;
+                s1_src2   <= fu_src2;
+                s1_tag    <= fu_tag;
+                s1_acc    <= fu_acc;
+                s1_is_mul <= fu_is_mul;
 
-            // ---- Single-cycle operations: bypass pipeline ----
-            if (fu_valid && (fu_opcode == OP_ADDWC || fu_opcode == OP_SUBWB || fu_opcode == OP_CLZ)) begin
-                result_valid    <= 1'b1;
-                result_tag      <= fu_tag;
-                result_dest_reg <= fu_dest_reg;
-                result_opcode   <= fu_opcode;
-
-                if (fu_opcode == OP_ADDWC) begin
-                    {result_carry, result_data} <= {1'b0, fu_src1} + {1'b0, fu_src2} + {32'd0, fu_imm[0]};
-                end else if (fu_opcode == OP_SUBWB) begin
-                    {result_carry, result_data} <= {1'b0, fu_src1} - {1'b0, fu_src2} - {32'd0, fu_imm[0]};
-                end else begin // CLZ
-                    result_data  <= {26'd0, clz32(fu_src1)};
-                    result_carry <= 1'b0;
-                end
-            end
-
-            // ---- Multi-cycle operations: enter pipeline ----
-            // Stage 1 capture
-            if (fu_valid && (fu_opcode == OP_MULFULL || fu_opcode == OP_ADDMUL)) begin
-                s1_valid    <= 1'b1;
-                s1_opcode   <= fu_opcode;
-                s1_src1     <= fu_src1;
-                s1_src2     <= fu_src2;
-                s1_tag      <= fu_tag;
-                s1_dest_reg <= fu_dest_reg;
-                s1_carry_in <= fu_imm[0]; // carry from dependency
+                // Pre-compute simple-op results
+                case (fu_opcode)
+                    OP_ADDWC: begin
+                        s1_simple_data <= add_result_wide[DATA_BITS-1:0];
+                        s1_simple_hi   <= {31'd0, add_result_wide[DATA_BITS]};
+                    end
+                    OP_SUBWB: begin
+                        s1_simple_data <= sub_result_wide[DATA_BITS-1:0];
+                        s1_simple_hi   <= {31'd0, sub_result_wide[DATA_BITS]};
+                    end
+                    OP_CLZ: begin
+                        s1_simple_data <= {26'd0, clz32(fu_src1)};
+                        s1_simple_hi   <= {DATA_BITS{1'b0}};
+                    end
+                    default: begin
+                        // Multiply ops — simple results unused
+                        s1_simple_data <= {DATA_BITS{1'b0}};
+                        s1_simple_hi   <= {DATA_BITS{1'b0}};
+                    end
+                endcase
             end else begin
                 s1_valid <= 1'b0;
             end
+        end
+    end
 
-            // Stage 2: multiply (DSP48E1 infers here)
-            s2_valid    <= s1_valid;
-            s2_opcode   <= s1_opcode;
-            s2_tag      <= s1_tag;
-            s2_dest_reg <= s1_dest_reg;
-            s2_product  <= {32'd0, s1_src1} * {32'd0, s1_src2}; // 32x32->64
+    // -------------------------------------------------------------------
+    // Stage 2: Multiply (DSP48E1) / Simple-op forwarding
+    // -------------------------------------------------------------------
+    always @(posedge clk) begin
+        if (rst) begin
+            s2_valid        <= 1'b0;
+            s2_simple_valid <= 1'b0;
+        end else begin
+            // Multiply path: s1 → s2 (only for mul ops)
+            if (s1_valid && s1_is_mul) begin
+                s2_valid   <= 1'b1;
+                s2_opcode  <= s1_opcode;
+                s2_tag     <= s1_tag;
+                s2_acc     <= s1_acc;
+                // M3 fix: let Verilog infer 32x32 → 64-bit multiply naturally.
+                // Do NOT zero-extend to 64 bits before multiplying.
+                s2_product <= s1_src1 * s1_src2;
+            end else begin
+                s2_valid <= 1'b0;
+            end
 
-            // Stage 3: output
+            // Simple-op path: s1 → s2_simple (skip multiply, go to output)
+            if (s1_valid && !s1_is_mul) begin
+                s2_simple_valid  <= 1'b1;
+                s2_simple_opcode <= s1_opcode;
+                s2_simple_tag    <= s1_tag;
+                s2_simple_data   <= s1_simple_data;
+                s2_simple_hi     <= s1_simple_hi;
+            end else begin
+                s2_simple_valid <= 1'b0;
+            end
+        end
+    end
+
+    // -------------------------------------------------------------------
+    // Stage 3 / Output: Final result register
+    //
+    // Multiply ops arrive from s2 (3-cycle latency).
+    // Simple ops arrive from s2_simple (2-cycle latency).
+    //
+    // M1 fix: both paths produce output on different cycles because they
+    // enter the pipeline on the same cycle but exit on different cycles.
+    // However, if a simple op is dispatched while a multiply is in s2
+    // (about to complete), both could try to output simultaneously.
+    //
+    // Resolution: multiply takes priority; simple result goes to a
+    // 1-entry hold buffer and outputs the next cycle.
+    // -------------------------------------------------------------------
+    reg                    hold_valid;
+    reg [3:0]              hold_opcode;
+    reg [TAG_BITS-1:0]     hold_tag;
+    reg [DATA_BITS-1:0]    hold_data;
+    reg [DATA_BITS-1:0]    hold_hi;
+
+    // Accumulate: product + acc. 65 bits to capture carry out of bit 63.
+    // {acc_hi, acc_lo} = product[63:0] + {32'd0, acc[31:0]}
+    wire [64:0] acc_sum = {1'b0, s2_product} + {33'd0, s2_acc};
+
+    always @(posedge clk) begin
+        if (rst) begin
+            result_valid <= 1'b0;
+            hold_valid   <= 1'b0;
+        end else begin
+            // Default: no output
+            result_valid <= 1'b0;
+
+            // Priority 1: Multiply result from s2
             if (s2_valid) begin
-                result_valid    <= 1'b1;
-                result_tag      <= s2_tag;
-                result_dest_reg <= s2_dest_reg;
-                result_opcode   <= s2_opcode;
+                result_valid  <= 1'b1;
+                result_tag    <= s2_tag;
+                result_opcode <= s2_opcode;
 
                 if (s2_opcode == OP_ADDMUL) begin
-                    // ADDMUL: low 32 bits of product (hireg accumulation handled externally)
-                    result_data  <= s2_product[31:0];
-                    result_carry <= |s2_product[63:32]; // carry if high bits nonzero
+                    // M2d fix: fused multiply-accumulate
+                    // {hi, lo} = src1 * src2 + acc
+                    result_data <= acc_sum[DATA_BITS-1:0];
+                    result_hi   <= acc_sum[2*DATA_BITS-1:DATA_BITS];
                 end else begin
-                    // MULFULL: low 32 bits (high 32 go to HIREG via separate path)
-                    result_data  <= s2_product[31:0];
-                    result_carry <= 1'b0;
+                    // MULFULL: M2c fix — output full high word
+                    result_data <= s2_product[DATA_BITS-1:0];
+                    result_hi   <= s2_product[2*DATA_BITS-1:DATA_BITS];
                 end
+
+                // If a simple op also wants to output, hold it
+                if (s2_simple_valid) begin
+                    hold_valid  <= 1'b1;
+                    hold_opcode <= s2_simple_opcode;
+                    hold_tag    <= s2_simple_tag;
+                    hold_data   <= s2_simple_data;
+                    hold_hi     <= s2_simple_hi;
+                end else begin
+                    hold_valid <= 1'b0;
+                end
+
+            // Priority 2: Held simple result (from collision)
+            end else if (hold_valid) begin
+                result_valid  <= 1'b1;
+                result_tag    <= hold_tag;
+                result_opcode <= hold_opcode;
+                result_data   <= hold_data;
+                result_hi     <= hold_hi;
+                hold_valid    <= 1'b0;
+
+            // Priority 3: Simple op result from s2_simple
+            end else if (s2_simple_valid) begin
+                result_valid  <= 1'b1;
+                result_tag    <= s2_simple_tag;
+                result_opcode <= s2_simple_opcode;
+                result_data   <= s2_simple_data;
+                result_hi     <= s2_simple_hi;
+                hold_valid    <= 1'b0;
+
+            end else begin
+                hold_valid <= 1'b0;
             end
         end
     end

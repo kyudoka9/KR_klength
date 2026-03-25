@@ -49,13 +49,31 @@
 // ============================================================================
 // BRAM operand memory layout (word addresses, not byte)
 // ============================================================================
-// 0x0000 - 0x0FFF: Operand A (up to 4096 words = 131,072 bits)
-// 0x1000 - 0x1FFF: Operand B
-// 0x2000 - 0x3FFF: Result (up to 8192 words)
+// Layout depends on BRAM address width, which varies by FPGA target.
+// Artix-7 (Mimas A7): BRAM_ADDR_W=13 -> 8192 words total
+// Kintex-7:           BRAM_ADDR_W=15 -> 32768 words total
 
-#define BRAM_OPERAND_A   0x0000
-#define BRAM_OPERAND_B   0x1000
-#define BRAM_RESULT      0x2000
+#ifndef BRAM_ADDR_W
+#define BRAM_ADDR_W 13  // default to Artix-7 (conservative)
+#endif
+
+#if BRAM_ADDR_W <= 13
+  // Artix-7: 8192 words total
+  // A: 0x0000-0x03FF (1024 words), B: 0x0400-0x07FF (1024 words),
+  // R: 0x0800-0x0FFF (2048 words, covers 1024x1024 multiply)
+  #define BRAM_OPERAND_A   0x0000
+  #define BRAM_OPERAND_B   0x0400
+  #define BRAM_RESULT      0x0800
+  #define BRAM_MAX_WORDS   1024
+#else
+  // Kintex-7 or larger: 32768+ words total
+  // A: 0x0000-0x0FFF (4096 words), B: 0x1000-0x1FFF (4096 words),
+  // R: 0x2000-0x3FFF (8192 words, covers 4096x4096 multiply)
+  #define BRAM_OPERAND_A   0x0000
+  #define BRAM_OPERAND_B   0x1000
+  #define BRAM_RESULT      0x2000
+  #define BRAM_MAX_WORDS   4096
+#endif
 
 // Access shared BRAM as an array of uint32_t
 #define BRAM_WORD(addr) (*(volatile uint32_t *)(KLENGTH_BRAM_BASE + ((addr) << 2)))
@@ -89,10 +107,13 @@ static inline uint32_t klength_progress(void) {
 // Multi-precision operations
 // ============================================================================
 
-// Load an operand into BRAM
-static inline void klength_load(uint32_t bram_offset, const uint32_t *data, int len) {
+// Load an operand into BRAM.
+// Returns 0 on success, -1 if len exceeds BRAM_MAX_WORDS.
+static inline int klength_load(uint32_t bram_offset, const uint32_t *data, int len) {
+    if (len < 0 || len > BRAM_MAX_WORDS) return -1;
     for (int i = 0; i < len; i++)
         BRAM_WORD(bram_offset + i) = data[i];
+    return 0;
 }
 
 // Read result from BRAM
@@ -142,10 +163,12 @@ static inline uint32_t klength_mpsub(uint32_t *result, const uint32_t *a,
 
 // MPMUL: result = a * b (k-length multiplication)
 // Result is len_a + len_b words long.
+// Returns cycle count on success, 0 if operands exceed BRAM capacity.
 static inline uint32_t klength_mpmul(uint32_t *result, const uint32_t *a, int len_a,
                                       const uint32_t *b, int len_b) {
-    klength_load(BRAM_OPERAND_A, a, len_a);
-    klength_load(BRAM_OPERAND_B, b, len_b);
+    if (len_a > BRAM_MAX_WORDS || len_b > BRAM_MAX_WORDS) return 0;
+    if (klength_load(BRAM_OPERAND_A, a, len_a) != 0) return 0;
+    if (klength_load(BRAM_OPERAND_B, b, len_b) != 0) return 0;
 
     // Clear result buffer (multiply accumulates into it)
     for (int i = 0; i < len_a + len_b; i++)

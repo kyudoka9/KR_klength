@@ -20,18 +20,19 @@
 // ============================================================================
 //
 // All instructions use R-type format via custom-0 opcode (0b0001011).
-// funct7 = 0b0000000 for all current instructions.
-// funct3 selects the operation:
+// funct3 selects the operation; funct7 distinguishes variants:
 //
-//   funct3  Mnemonic    Description
-//   000     ADDWC       Add with carry
-//   001     SUBWB       Subtract with borrow
-//   010     MULFULL     Full-width multiply
-//   011     ADDMUL      Multiply-accumulate
-//   100     DIVDW       Double-width divide
-//   101     CLZ         Count leading zeros
-//   110     RDHIREG     Read HIREG
-//   111     WRHIREG     Write HIREG
+//   funct3  funct7     Mnemonic    Description
+//   000     0000000    ADDWC       Add with carry
+//   001     0000000    SUBWB       Subtract with borrow
+//   010     0000000    MULFULL     Full-width multiply
+//   011     0000000    ADDMUL      Multiply-accumulate
+//   100     0000000    DIVDW       Double-width divide
+//   101     0000000    CLZ         Count leading zeros
+//   110     0000000    RDHIREG     Read HIREG
+//   110     0000001    RDCARRY     Read carry flag
+//   111     0000000    WRHIREG     Write HIREG
+//   111     0000001    WRCARRY     Write carry flag
 
 // ============================================================================
 // Core bignum intrinsics
@@ -97,6 +98,20 @@ static inline uint32_t kr_wrhireg(uint32_t val) {
   return neorv32_cfu_r_instr(0b0000000, 0b111, val, 0);
 }
 
+// RDCARRY: rd = carry flag (0 or 1).
+// Reads the internal carry/overflow flag that is normally implicit.
+// Single-cycle.
+static inline uint32_t kr_rdcarry(void) {
+  return neorv32_cfu_r_instr(0b0000001, 0b110, 0, 0);
+}
+
+// WRCARRY: carry = rs1[0]; rd = old carry (0 or 1).
+// Writes the internal carry/overflow flag directly.
+// Single-cycle.
+static inline uint32_t kr_wrcarry(uint32_t val) {
+  return neorv32_cfu_r_instr(0b0000001, 0b111, val, 0);
+}
+
 
 // ============================================================================
 // Pari/GP-compatible wrappers
@@ -108,33 +123,47 @@ static inline uint32_t kr_wrhireg(uint32_t val) {
 // these as internal shadow registers. Use kr_rdhireg() to read hiremainder
 // and the carry is implicit in ADDWC/SUBWB chains.
 
-// addll: add two words, set overflow (carry) flag
-// Returns low word of result.
+// addll: add two words, return result.
+// Caller is responsible for tracking overflow in a software variable,
+// matching Pari/GP's kernel/none/addll.h semantics.
+// Uses plain C (not ADDWC) because the Pari/GP overflow variable is
+// a separate software concept from the CFU's internal carry flag.
 static inline uint32_t kr_addll(uint32_t a, uint32_t b) {
-  // First clear carry, then add
-  (void)kr_wrhireg(0); // clear state (not strictly needed if carry is separate)
-  // We need to clear carry first. Use ADDWC with carry=0 state.
-  // The carry flag persists between instructions. For addll (first add in chain),
-  // we need carry_in = 0. Use SUBWB(0,0) to clear carry, then ADDWC.
-  // Actually simpler: just use ADDWC. If user calls addll first (not addllx),
-  // they should ensure carry is cleared.
-  return kr_addwc(a, b);
+  return a + b;
+  // Caller checks overflow: overflow = (result < a);
 }
 
-// addllx: add two words with carry from previous operation
-// Returns low word of result. Carry flag updated.
-static inline uint32_t kr_addllx(uint32_t a, uint32_t b) {
-  return kr_addwc(a, b);
+// addllx: add two words plus carry_in (from software overflow variable).
+// Caller passes carry_in and receives the new carry out.
+// This matches Pari/GP's kernel/none/addll.h exactly:
+//   tmp = a + carry_in; ov1 = (tmp < a);
+//   result = tmp + b;   ov2 = (result < tmp);
+//   overflow = ov1 | ov2;
+static inline uint32_t kr_addllx(uint32_t a, uint32_t b, uint32_t carry_in,
+                                  uint32_t *overflow_out) {
+  uint32_t tmp = a + carry_in;
+  uint32_t ov1 = (tmp < a);
+  uint32_t result = tmp + b;
+  *overflow_out = ov1 | (result < tmp);
+  return result;
 }
 
-// subll: subtract two words, set overflow (borrow) flag
+// subll: subtract two words, return result.
+// Caller checks overflow: overflow = (b > a);
 static inline uint32_t kr_subll(uint32_t a, uint32_t b) {
-  return kr_subwb(a, b);
+  return a - b;
+  // Caller checks overflow: overflow = (b > a);
 }
 
-// subllx: subtract two words with borrow from previous operation
-static inline uint32_t kr_subllx(uint32_t a, uint32_t b) {
-  return kr_subwb(a, b);
+// subllx: subtract two words minus borrow_in (from software overflow variable).
+// Caller passes borrow_in and receives the new borrow out.
+static inline uint32_t kr_subllx(uint32_t a, uint32_t b, uint32_t borrow_in,
+                                  uint32_t *overflow_out) {
+  uint32_t tmp = a - borrow_in;
+  uint32_t ov1 = (a < borrow_in);
+  uint32_t result = tmp - b;
+  *overflow_out = ov1 | (b > tmp);
+  return result;
 }
 
 // mulll: multiply two words, hiremainder = high word, returns low word
@@ -193,8 +222,17 @@ static inline void kr_mpn_mul(uint32_t *r, const uint32_t *a, int na,
         kr_wrhireg(hi + 1);
       }
     }
-    // Store final hireg as carry into result[i + nb]
-    r[i + nb] += kr_rdhireg();
+    // Store final hireg as carry into result[i + nb], propagate if overflow
+    uint32_t hi = kr_rdhireg();
+    uint32_t old = r[i + nb];
+    r[i + nb] = old + hi;
+    if (r[i + nb] < old) {
+      // Propagate carry through remaining result words
+      for (int k = i + nb + 1; k < na + nb; k++) {
+        r[k]++;
+        if (r[k] != 0) break;
+      }
+    }
   }
 }
 

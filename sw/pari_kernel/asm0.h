@@ -63,50 +63,55 @@ NOASM (none -- all primitives are hardware-accelerated)
 /* ------------------------------------------------------------------ */
 /* addll: a + b, set overflow                                         */
 /*                                                                    */
-/* Stock RISC-V:  add + sltu              = 2 instructions            */
-/* KR k-Length:   ADDWC                   = 1 instruction             */
+/* Uses plain C addition with software overflow tracking to match     */
+/* Pari/GP's kernel/none/addll.h semantics exactly.                   */
+/* The ADDWC instruction is for the k-length decomp engine (MPADD),   */
+/* not for the Pari/GP compatibility layer.                           */
 /* ------------------------------------------------------------------ */
 #define addll(a, b) \
 __extension__ ({ \
   ulong __arg1 = (a), __arg2 = (b); \
-  /* Clear carry before first add in chain */ \
-  KR_SUBWB(0, 0); \
-  ulong __value = KR_ADDWC(__arg1, __arg2); \
-  /* Carry is inside the CFU; read it out for Pari/GP's 'overflow' */ \
-  overflow = KR_RDHIREG() ? 0 : ((__value < __arg1) ? 1 : 0); \
+  ulong __value = __arg1 + __arg2; \
+  overflow = (__value < __arg1); \
   __value; \
 })
 
 /* ------------------------------------------------------------------ */
 /* addllx: a + b + overflow (carry chain continuation)                */
 /*                                                                    */
-/* Stock RISC-V:  5 instructions (add+sltu+add+sltu+add)              */
-/* KR k-Length:   ADDWC                   = 1 instruction             */
-/*   Carry flag persists inside CFU between ADDWC calls.              */
+/* Uses plain C with software carry tracking, matching                */
+/* Pari/GP's kernel/none/addll.h exactly.                             */
 /* ------------------------------------------------------------------ */
 #define addllx(a, b) \
 __extension__ ({ \
-  ulong __value = KR_ADDWC((a), (b)); \
-  overflow = (__value < (ulong)(a)) ? 1 : 0; \
+  ulong __arg1 = (a), __arg2 = (b), __tmp; \
+  __tmp = __arg1 + overflow; \
+  ulong __ov1 = (__tmp < __arg1); \
+  ulong __value = __tmp + __arg2; \
+  overflow = __ov1 | (__value < __tmp); \
   __value; \
 })
 
 /* ------------------------------------------------------------------ */
 /* subll / subllx: subtraction with borrow                            */
+/*                                                                    */
+/* Uses plain C with software overflow tracking, matching             */
+/* Pari/GP's kernel/none/addll.h exactly.                             */
 /* ------------------------------------------------------------------ */
 #define subll(a, b) \
 __extension__ ({ \
   ulong __arg1 = (a), __arg2 = (b); \
-  KR_SUBWB(0, 0); \
-  ulong __value = KR_SUBWB(__arg1, __arg2); \
-  overflow = (__arg2 > __arg1) ? 1 : 0; \
-  __value; \
+  overflow = (__arg2 > __arg1); \
+  __arg1 - __arg2; \
 })
 
 #define subllx(a, b) \
 __extension__ ({ \
-  ulong __value = KR_SUBWB((a), (b)); \
-  overflow = ((b) > (a)) ? 1 : 0; \
+  ulong __arg1 = (a), __arg2 = (b), __tmp; \
+  __tmp = __arg1 - overflow; \
+  ulong __ov1 = (__arg1 < overflow); \
+  ulong __value = __tmp - __arg2; \
+  overflow = __ov1 | (__arg2 > __tmp); \
   __value; \
 })
 

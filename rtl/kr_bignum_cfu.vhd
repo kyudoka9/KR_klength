@@ -15,7 +15,9 @@
 --   100     0000000    DIVDW       {HIREG,rd} = {HIREG,rs1} / rs2      34           --
 --   101     0000000    CLZ         rd = count_leading_zeros(rs1)        1            --
 --   110     0000000    RDHIREG     rd = HIREG                          1            --
+--   110     0000001    RDCARRY     rd = {31'd0, carry}                  1            --
 --   111     0000000    WRHIREG     HIREG = rs1; rd = old HIREG          1            --
+--   111     0000001    WRCARRY     carry = rs1[0]; rd = {31'd0, old carry} 1         --
 --                                                                                  --
 -- HIREG is a shadow register mirroring Pari/GP's 'hiremainder' global.             --
 -- Carry/borrow is a 1-bit internal flag, also mirroring Pari/GP's 'overflow'.      --
@@ -290,11 +292,15 @@ begin
           when CLZ_F3 => -- CLZ: single-cycle, no state update
             null;
 
-          when RDHIREG_F3 => -- RDHIREG: rd = HIREG (no state change)
-            null;
+          when RDHIREG_F3 => -- RDHIREG / RDCARRY (distinguished by funct7)
+            null; -- RDHIREG: no state change; RDCARRY: no state change
 
-          when WRHIREG_F3 => -- WRHIREG: HIREG = rs1, rd = old HIREG
-            hireg <= rs1_i;
+          when WRHIREG_F3 => -- WRHIREG / WRCARRY (distinguished by funct7)
+            if funct7_i(0) = '1' then
+              carry <= rs1_i(0); -- WRCARRY: carry = rs1[0]
+            else
+              hireg <= rs1_i;    -- WRHIREG: HIREG = rs1
+            end if;
 
           when others =>
             null;
@@ -309,8 +315,8 @@ begin
   -- ===========================================================================
   -- Result multiplexer and valid signal
   -- ===========================================================================
-  result_mux: process(type_i, funct3_i, rs1_i, rs2_i, hireg, carry, mul_s3_valid,
-                      mul_s3_lo, div_done, div_quotient, div_busy)
+  result_mux: process(type_i, funct3_i, funct7_i, rs1_i, rs2_i, hireg, carry,
+                      mul_s3_valid, mul_s3_lo, div_done, div_quotient, div_busy)
     variable sum33 : unsigned(32 downto 0);
   begin
     result_o <= (others => '0');
@@ -341,12 +347,24 @@ begin
           result_o <= x"000000" & "00" & f_clz32(rs1_i);
           valid_o  <= '1';
 
-        when RDHIREG_F3 => -- read HIREG, 1 cycle
-          result_o <= hireg;
+        when RDHIREG_F3 => -- RDHIREG or RDCARRY, 1 cycle
+          if funct7_i(0) = '1' then
+            -- RDCARRY: rd = {31'd0, carry}
+            result_o <= (31 downto 1 => '0') & carry;
+          else
+            -- RDHIREG: rd = HIREG
+            result_o <= hireg;
+          end if;
           valid_o  <= '1';
 
-        when WRHIREG_F3 => -- write HIREG, return old value, 1 cycle
-          result_o <= hireg;
+        when WRHIREG_F3 => -- WRHIREG or WRCARRY, 1 cycle
+          if funct7_i(0) = '1' then
+            -- WRCARRY: rd = {31'd0, old carry}
+            result_o <= (31 downto 1 => '0') & carry;
+          else
+            -- WRHIREG: rd = old HIREG
+            result_o <= hireg;
+          end if;
           valid_o  <= '1';
 
         when others =>
