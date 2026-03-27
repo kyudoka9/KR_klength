@@ -5,6 +5,8 @@
   Proves correctness of multi-precision addition (MPADD) built on
   word-level ADDWC from KLengthArith. Uses Mathlib's nlinarith for
   nonlinear arithmetic involving MOD^(n+1) = MOD * MOD^n.
+
+  No sorry.
 -/
 
 import KLengthProofs.KLengthArith
@@ -47,19 +49,24 @@ theorem mpadd_correct (a b : List Nat) (c : Nat) (h : a.length = b.length) :
   induction a, b, c using mpadd.induct with
   | case1 c => simp [mpadd, mpn_value]
   | case2 a as b bs c p_eq ih =>
-    -- p_eq : p = addwc a b c  (the let binding)
-    -- ih   : inductive hypothesis for the tail
     simp only [mpadd, mpn_value, List.length_cons]
     have hlen : as.length = bs.length := by simpa using h
-    have hih := ih hlen
-    -- hih : mpn_value (mpadd as bs (addwc a b c).2).1
-    --         + (mpadd as bs (addwc a b c).2).2 * MOD ^ as.length
-    --       = mpn_value as + mpn_value bs + (addwc a b c).2
-    have hspec := addwc_spec a b c
-    -- hspec : (addwc a b c).1 + (addwc a b c).2 * MOD = a + b + c
-    rw [show as.length + 1 = as.length.succ from rfl, Nat.pow_succ]
-    nlinarith [hih, hspec, Nat.mul_comm MOD (MOD ^ as.length)]
+    -- Introduce names for the key subexpressions
+    set lo := (addwc a b c).1
+    set hi := (addwc a b c).2
+    set rv := mpn_value (mpadd as bs hi).1
+    set rc := (mpadd as bs hi).2
+    -- Inductive hypothesis: tail addition is correct
+    have hih : rv + rc * MOD ^ as.length =
+      mpn_value as + mpn_value bs + hi := ih hlen
+    -- Word-level spec: lo + hi * MOD = a + b + c
+    have hspec : lo + hi * MOD = a + b + c := addwc_spec a b c
+    -- Rewrite MOD^(n+1) = MOD^n * MOD for nlinarith
+    have hpow : MOD ^ (as.length + 1) = MOD ^ as.length * MOD :=
+      Nat.pow_succ MOD as.length
+    nlinarith
   | case3 t x c hn hc =>
+    -- Catch-all: mismatched list shapes are impossible given h
     cases t with
     | nil =>
       cases x with
